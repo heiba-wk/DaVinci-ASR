@@ -1,0 +1,74 @@
+from __future__ import annotations
+
+RUNTIME_VERSION = "1.0.0"
+PROTOCOL_VERSION = 1
+SELF_TEST_REVISION = 3
+SAMPLE_RATE = 16_000
+VAD_THRESHOLD = 0.45
+VAD_MIN_SPEECH_MS = 180
+VAD_MIN_SILENCE_MS = 300
+VAD_SPEECH_PAD_MS = 200
+VAD_ANALYSIS_BLOCK_SECONDS = 300
+VAD_ANALYSIS_OVERLAP_SECONDS = 1.0
+WINDOW_TARGET_SECONDS = 45
+WINDOW_SOFT_MAX_SECONDS = 60
+WINDOW_HARD_MAX_SECONDS = 90
+WINDOW_CONTEXT_SECONDS = 1.5
+WINDOW_MIN_CORE_SECONDS = 15
+ALIGNMENT_MIN_TEXT_COVERAGE = 0.82
+ALIGNMENT_BOUNDARY_MAX_TIMESTAMP_BINS = 2
+TOKEN_DUPLICATE_START_SECONDS = 0.35
+REGION_MERGE_GAP_SECONDS = 0.30
+RECOVERY_CONTEXT_SECONDS = 5.0
+RECOVERY_CORE_MAX_SECONDS = 30.0
+ASR_WINDOW_MAX_NEW_TOKENS = 4096
+IDLE_MODEL_RELEASE_SECONDS = 15 * 60
+HEARTBEAT_STALE_SECONDS = 10
+HEARTBEAT_INTERVAL_SECONDS = 2.0
+ACTIVE_POLL_SECONDS = 0.25
+IDLE_POLL_SECONDS = 1.0
+ACTIVE_POLL_WINDOW_SECONDS = 30.0
+IPC_CLEANUP_INTERVAL_SECONDS = 60.0
+IPC_SUCCESS_TTL_SECONDS = 24 * 60 * 60
+IPC_DIAGNOSTIC_TTL_SECONDS = 3 * 24 * 60 * 60
+IPC_MAX_TERMINAL_JOBS = 100
+AUDIO_STREAM_BLOCK_SECONDS = 30
+
+ASR_MODEL_KEY = "asr"
+ALIGNER_MODEL_KEY = "forced_aligner"
+
+ALIGNMENT_LANGUAGES: tuple[str, ...] = (
+    "Chinese",
+    "English",
+    "Cantonese",
+    "French",
+    "German",
+    "Italian",
+    "Japanese",
+    "Korean",
+    "Portuguese",
+    "Russian",
+    "Spanish",
+)
+
+UI_LANGUAGES: tuple[str, ...] = ("Auto", *ALIGNMENT_LANGUAGES)
+INTERFACE_LANGUAGES: tuple[str, ...] = ("cn", "en")
+
+JOB_STATES: tuple[str, ...] = (
+    "queued",
+    "preparing",
+    "loading_asr",
+    "transcribing",
+    "unloading_asr",
+    "loading_aligner",
+    "aligning",
+    "segmenting",
+    "writing_srt",
+    "done",
+    "cancelled",
+    "error",
+)
+
+UNSUPPORTED_ALIGNMENT_ERROR = (
+    "Detected language is currently unsupported for timestamp alignment."
+)

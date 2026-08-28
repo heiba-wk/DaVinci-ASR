@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+RUNTIME_APP="/Library/Application Support/HEIBA/DaVinciASR/runtime/DaVinci ASR.app"
+RUNTIME_EXE="$RUNTIME_APP/Contents/MacOS/DaVinci ASR"
+UTILITY_ROOT="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+PLUGIN_ROOT="$UTILITY_ROOT/DaVinci ASR"
+LUA_ENTRY="$PLUGIN_ROOT/DaVinci ASR.lua"
+CONFIG_DIR="$PLUGIN_ROOT/config"
+MODELS_DIR="$PLUGIN_ROOT/models"
+AUDIO_TEMP_DIR="$PLUGIN_ROOT/audio_temp"
+TEMP_DIR="$PLUGIN_ROOT/temp"
+
+chmod -R a+rX "$RUNTIME_APP"
+chmod 755 "$RUNTIME_EXE"
+chmod 644 "$LUA_ENTRY"
+mkdir -p "$CONFIG_DIR" "$AUDIO_TEMP_DIR" "$TEMP_DIR"
+
+if [[ ! -e "$MODELS_DIR" && ! -L "$MODELS_DIR" ]]; then
+    mkdir -p "$MODELS_DIR"
+    chown root:staff "$MODELS_DIR"
+    chmod 775 "$MODELS_DIR"
+fi
+
+for writable_dir in "$CONFIG_DIR" "$AUDIO_TEMP_DIR" "$TEMP_DIR"; do
+    chown root:staff "$writable_dir"
+    chmod 775 "$writable_dir"
+done
+if [[ -f "$CONFIG_DIR/setting.json" ]]; then
+    chown root:staff "$CONFIG_DIR/setting.json"
+    chmod 664 "$CONFIG_DIR/setting.json"
+fi
+
+exit 0

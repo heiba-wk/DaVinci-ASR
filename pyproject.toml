@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "davinci-asr-runtime"
+version = "1.0.0"
+description = "Local runtime for the DaVinci ASR Resolve plugin"
+readme = "README.md"
+requires-python = "==3.12.*"
+license = { text = "Apache-2.0" }
+authors = [{ name = "HEIBA" }]
+dependencies = [
+    "jieba==0.42.1",
+    "modelscope-hub>=0.1.8",
+    "silero-vad==6.2.1",
+    "torchaudio==2.9.0",
+    "wcwidth==0.2.13",
+]
+
+[project.scripts]
+DaVinciASRRuntime = "runtime.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["runtime*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

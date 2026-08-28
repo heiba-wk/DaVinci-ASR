@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "user_settings_storage": "platform_application_data",
+  "note": "User settings are never written to the Resolve Scripts directory."
+}

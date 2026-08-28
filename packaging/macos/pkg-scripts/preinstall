@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ ! -d "/Applications/DaVinci Resolve/DaVinci Resolve.app" ]] && \
+   [[ ! -d "/Library/Application Support/Blackmagic Design/DaVinci Resolve" ]]; then
+    echo "DaVinci Resolve was not detected. Install DaVinci Resolve before DaVinci ASR." >&2
+    exit 1
+fi
+
+exit 0

@@ -1,0 +1,58 @@
+.DS_Store
+.idea/
+.vscode/
+.env
+.env.*
+**/id_rsa
+**/id_ed25519
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.dev-runtime/
+build/
+dist/
+*.egg-info/
+requirements/locks/*.txt
+!requirements/locks/README.md
+release-gates/*.validated.json
+benchmark_results/
+
+# The parent Utility repository ignores generic test_*.py files. This project
+# intentionally versions its complete unittest suite.
+!tests/test_*.py
+
+# Models and generated runtime state never belong in source control.
+models/Qwen3-ASR-0.6B-hf/
+models/Qwen3-ASR-0.6B-non-hf/
+models/Qwen3-ForcedAligner-0.6B-hf/
+models/**/*.part
+DaVinci ASR/models/*
+!DaVinci ASR/models/.gitkeep
+runtime_state/
+*.wav
+*.srt
+*.log
+
+# Version the validated corpus used by the default multilingual benchmark.
+!DaVinci ASR/test/
+DaVinci ASR/test/*
+!DaVinci ASR/test/*.txt
+!DaVinci ASR/test/*.json
+!DaVinci ASR/test/*.wav
+
+# The Resolve-side temp directory is intentionally present but empty.
+DaVinci ASR/temp/*
+!DaVinci ASR/temp/.gitkeep
+
+# Resolve render cache and local model archives are generated/user-managed.
+DaVinci ASR/audio_temp/*
+!DaVinci ASR/audio_temp/.gitkeep
+DaVinci ASR/models.zip

@@ -1,0 +1,14 @@
+# Direct runtime inputs. Release builds must compile these into a hashed,
+# platform-specific lock after the real platform inference tests pass.
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1
+torch==2.9.0
+torchaudio==2.9.0
+silero-vad==6.2.1
+jieba==0.42.1
+nagisa==0.2.11
+safetensors==0.8.0
+wcwidth==0.2.13
+modelscope-hub>=0.1.8
+transformers @ https://codeload.github.com/huggingface/transformers/tar.gz/c7f9c8815610d27e41a6b0b0cc9e2d3c49468d1d
