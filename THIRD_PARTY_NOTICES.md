@@ -19,6 +19,14 @@ file and the license files emitted by the hashed dependency lock.
 - Model weights remain outside both the Git source repository and release
   installers; separately supplied files are verified by the model manifest.
 
+## Qwen3-ASR-1.7B-hf
+
+- Model: <https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf>
+- Fixed revision: `bcd2b5b7f32b480ab5790554cfa8347f246a14f3`
+- License: Apache License 2.0
+- Model weights remain outside both the Git source repository and release
+  installers; separately supplied files are verified by the model manifest.
+
 ## Qwen3-ForcedAligner-0.6B-hf
 
 - Model: <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf>
@@ -51,7 +59,8 @@ file and the license files emitted by the hashed dependency lock.
 - Minimum version: `0.1.8`
 - License: Apache License 2.0
 - Used only by the private Runtime as the China-first repair download source
-  for `Qwen/Qwen3-ASR-0.6B-hf`; inference remains local and source-independent.
+  for the supported Qwen3 ASR models; inference remains local and
+  source-independent.
 
 ## nagisa
 

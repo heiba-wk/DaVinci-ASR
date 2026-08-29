@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from runtime.constants import (
+    ASR_MODEL_KEY,
+    ASR_MODEL_KEYS,
     INTERFACE_LANGUAGES,
     JOB_STATES,
     PROTOCOL_VERSION,
@@ -53,6 +55,7 @@ class JobRequest:
     language: str = "Auto"
     prompt: str = ""
     ui_language: str = "cn"
+    asr_model: str = ASR_MODEL_KEY
     download_source: str = ""
     subtitle: SubtitleOptions = field(default_factory=SubtitleOptions)
     timeline: TimelineSpec = field(default_factory=TimelineSpec)
@@ -74,6 +77,9 @@ class JobRequest:
         ui_language = str(value.get("ui_language", "cn"))
         if ui_language not in INTERFACE_LANGUAGES:
             raise ValueError(f"Unsupported UI language: {ui_language}")
+        asr_model = str(value.get("asr_model", ASR_MODEL_KEY)).strip()
+        if asr_model not in ASR_MODEL_KEYS:
+            raise ValueError(f"Unsupported ASR model: {asr_model}")
         action = str(value.get("action", "transcribe"))
         if action not in {
             "transcribe",
@@ -102,6 +108,7 @@ class JobRequest:
             language=language,
             prompt=str(value.get("prompt", "")),
             ui_language=ui_language,
+            asr_model=asr_model,
             download_source=download_source,
             subtitle=SubtitleOptions.from_dict(value.get("subtitle")),
             timeline=TimelineSpec.from_dict(value.get("timeline")),

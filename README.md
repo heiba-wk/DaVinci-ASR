@@ -6,10 +6,12 @@ DaVinci ASR is a local AI subtitle tool for DaVinci Resolve. It reads the audio 
 
 ## Models used
 
-- Speech recognition: `Qwen/Qwen3-ASR-0.6B-hf`
+- Speech recognition: `Qwen/Qwen3-ASR-0.6B-hf` or `Qwen/Qwen3-ASR-1.7B-hf`
 - Forced alignment: `Qwen/Qwen3-ForcedAligner-0.6B-hf`
 
-Both models are downloaded together from the plugin's model download dialog. The first download requires approximately 3.4 GB of disk space.
+The plugin downloads the selected speech-recognition model and the shared
+Forced Aligner. Switching speech-recognition models does not download the
+Forced Aligner again when it is already installed.
 
 ## macOS installation
 

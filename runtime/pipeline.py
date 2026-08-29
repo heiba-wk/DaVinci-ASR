@@ -614,7 +614,7 @@ class TranscriptionPipeline:
             previous_tail = ""
 
             update("loading_asr", 10, "Loading Qwen3 ASR")
-            asr, asr_load_ms = self.inference.acquire_asr()
+            asr, asr_load_ms = self.inference.acquire_asr(request.asr_model)
             metrics.values["asr_model_load_ms"] = round(asr_load_ms, 3)
             try:
                 for index, window in enumerate(windows):
@@ -752,7 +752,9 @@ class TranscriptionPipeline:
             recovery_records: list[WindowRecord] = []
             if recovery_regions:
                 update("loading_asr", 78, "Loading Qwen3 ASR for coverage recovery")
-                asr, recovery_asr_load_ms = self.inference.acquire_asr()
+                asr, recovery_asr_load_ms = self.inference.acquire_asr(
+                    request.asr_model
+                )
                 metrics.values["recovery_asr_model_load_ms"] = round(
                     recovery_asr_load_ms, 3
                 )
@@ -814,7 +816,7 @@ class TranscriptionPipeline:
                         name=self.hardware.name,
                     )
                     cpu_asr = self._asr_factory(
-                        self.models.model_path("asr"),
+                        self.models.model_path(request.asr_model),
                         cpu_profile,
                     )
                     cpu_load_started = time.monotonic()

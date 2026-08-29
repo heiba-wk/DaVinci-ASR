@@ -86,6 +86,7 @@ class RuntimeDaemon:
         self.last_metrics: dict[str, Any] = {}
         self.cached_model_status = {
             "asr": "Checking",
+            "asr_1_7b": "Checking",
             "forced_aligner": "Checking",
         }
         self._model_status_initialized = False
@@ -167,13 +168,15 @@ class RuntimeDaemon:
             self.hardware.validated = True
         return self.hardware
 
-    def _run_self_test(self) -> HardwareProfile:
+    def _run_self_test(self, asr_model: str = "asr") -> HardwareProfile:
         if self.self_test is not None:
             profile = self.self_test(self.paths)
         else:
             from runtime.selftest import validate_hardware_with_fallback
 
-            profile = validate_hardware_with_fallback(self.paths)
+            profile = validate_hardware_with_fallback(
+                self.paths, asr_model=asr_model
+            )
         profile.validated = True
         self.hardware = profile
         self._hardware_initialized = True
@@ -310,11 +313,16 @@ class RuntimeDaemon:
     ) -> None:
         self._raise_if_cancelled(cancel)
         self._ensure_hardware()
+        required_models = (request.asr_model, "forced_aligner")
+        for key in required_models:
+            ready, reason = self.models.verify(key, full_hash=False)
+            if not ready:
+                raise RuntimeError(f"{key} model is not installed: {reason}")
         if not self.hardware.validated:
             write_status(
                 files, "preparing", 2, "Verifying local models and hardware"
             )
-            for key in ("asr", "forced_aligner"):
+            for key in required_models:
                 ready, reason = self.models.verify(key, full_hash=True)
                 if not ready:
                     raise RuntimeError(f"{key} model verification failed: {reason}")
@@ -324,7 +332,7 @@ class RuntimeDaemon:
             ):
                 self.hardware.validated = True
             else:
-                self._run_self_test()
+                self._run_self_test(request.asr_model)
             self._raise_if_cancelled(cancel)
         pipeline = self._build_pipeline()
         result = pipeline.run(
@@ -376,6 +384,7 @@ class RuntimeDaemon:
             lambda: self._is_cancelled(cancel),
             ui_language=request.ui_language,
             source=request.download_source,
+            model_keys=(request.asr_model, "forced_aligner"),
         )
         self._raise_if_cancelled(cancel)
         invalidate = getattr(self.models, "invalidate_cache", None)
@@ -395,7 +404,7 @@ class RuntimeDaemon:
             total_bytes=latest.total_bytes if latest else 0,
             download_speed_bps=0,
         )
-        self._run_self_test()
+        self._run_self_test(request.asr_model)
         write_result(
             files,
             {
@@ -418,16 +427,18 @@ class RuntimeDaemon:
             download_speed_bps=0,
         )
 
-    def _process_self_test(self, files: JobFiles, cancel: CancelToken) -> None:
+    def _process_self_test(
+        self, request: JobRequest, files: JobFiles, cancel: CancelToken
+    ) -> None:
         self._raise_if_cancelled(cancel)
         write_status(files, "preparing", 10, "Running runtime model self test")
         self._ensure_hardware()
-        for key in ("asr", "forced_aligner"):
+        for key in (request.asr_model, "forced_aligner"):
             ready, reason = self.models.verify(key, full_hash=True, force=True)
             if not ready:
                 raise RuntimeError(f"{key} model verification failed: {reason}")
         self.validation_cache.invalidate()
-        self._run_self_test()
+        self._run_self_test(request.asr_model)
         self.refresh_model_status()
         self._raise_if_cancelled(cancel)
         write_result(
@@ -491,7 +502,7 @@ class RuntimeDaemon:
             elif request.action == "download_models":
                 self._process_download(request, files, cancel)
             elif request.action == "self_test":
-                self._process_self_test(files, cancel)
+                self._process_self_test(request, files, cancel)
             elif request.action == "cleanup_temp":
                 self._process_cleanup(files)
             elif request.action == "shutdown":

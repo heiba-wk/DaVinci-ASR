@@ -32,6 +32,7 @@ benchmark_results/
 # Models and generated runtime state never belong in source control.
 models/Qwen3-ASR-0.6B-hf/
 models/Qwen3-ASR-0.6B-non-hf/
+models/Qwen3-ASR-1.7B-hf/
 models/Qwen3-ForcedAligner-0.6B-hf/
 models/**/*.part
 DaVinci ASR/models/*

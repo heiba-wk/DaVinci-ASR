@@ -8,7 +8,13 @@ import time
 import uuid
 from pathlib import Path
 
-from runtime.constants import ALIGNMENT_LANGUAGES, PROTOCOL_VERSION, RUNTIME_VERSION
+from runtime.constants import (
+    ALIGNER_MODEL_KEY,
+    ALIGNMENT_LANGUAGES,
+    ASR_MODEL_KEY,
+    PROTOCOL_VERSION,
+    RUNTIME_VERSION,
+)
 from runtime.core.hardware import select_hardware
 from runtime.core.diagnostics import diagnostics_payload
 from runtime.core.paths import RuntimePaths
@@ -61,7 +67,12 @@ def command_download(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    manager.download_all(report, ui_language=args.ui_language, source=args.source)
+    manager.download_all(
+        report,
+        ui_language=args.ui_language,
+        source=args.source,
+        model_keys=(ASR_MODEL_KEY, ALIGNER_MODEL_KEY),
+    )
     return 0
 
 

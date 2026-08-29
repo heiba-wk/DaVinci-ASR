@@ -6,10 +6,10 @@ DaVinci ASR 是运行在 DaVinci Resolve 内的本地 AI 自动字幕工具。�
 
 ## 使用的模型
 
-- 语音识别：`Qwen/Qwen3-ASR-0.6B-hf`
+- 语音识别：`Qwen/Qwen3-ASR-0.6B-hf` 或 `Qwen/Qwen3-ASR-1.7B-hf`
 - 时间对齐：`Qwen/Qwen3-ForcedAligner-0.6B-hf`
 
-两个模型会在插件的“模型下载”中一起下载，首次下载约需 3.4 GB 空间。
+插件只下载当前选择的语音识别模型和共享的时间对齐模型。时间对齐模型已安装后，切换语音识别模型不会重复下载。
 
 ## macOS 安装
 

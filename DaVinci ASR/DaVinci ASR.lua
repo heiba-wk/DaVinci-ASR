@@ -120,6 +120,10 @@ do
         "Auto", "Chinese", "English", "Cantonese", "French", "German",
         "Italian", "Japanese", "Korean", "Portuguese", "Russian", "Spanish"
     }
+    Config.ASR_MODELS = {
+        { key = "asr", label = "Qwen3-ASR-0.6B" },
+        { key = "asr_1_7b", label = "Qwen3-ASR-1.7B" }
+    }
     Config.LANGUAGE_LABELS = {
         cn = {
             "自动检测（推荐）", "中文（普通话）", "英语", "粤语", "法语", "德语",
@@ -146,6 +150,7 @@ do
         error = true
     }
     Config.DEFAULTS = {
+        asr_model = "asr",
         language = "Auto",
         prompt = "",
         max_chars = 42,
@@ -1009,6 +1014,7 @@ do
     function Settings:save(values)
         local source = values or Config.DEFAULTS
         local payload = {
+            asr_model = tostring(source.asr_model or "asr"),
             language = tostring(source.language or "Auto"),
             prompt = tostring(source.prompt or ""),
             max_chars = tonumber(source.max_chars) or 42,
@@ -1644,6 +1650,10 @@ do
         runtime_missing_help = { cn = "组件缺失，请重新安装。", en = "Component missing. Reinstall the app." },
         request_write_failed = { cn = "任务文件写入失败。", en = "Could not write the task file." },
         model_source_invalid = { cn = "下载源无效。", en = "Invalid download source." },
+        runtime_model_unsupported = {
+            cn = "组件版本过旧，请重新安装后下载该模型。",
+            en = "The Runtime is outdated. Reinstall it before downloading this model."
+        },
         model_download_queued = { cn = "%s：准备下载。", en = "%s: preparing download." },
         download_connecting = { cn = "正在连接 %s…", en = "Connecting to %s…" },
         download_preparing = { cn = "正在准备模型下载…", en = "Preparing model download…" },
@@ -2237,6 +2247,7 @@ do
     function UI.collectSettings()
         local languageIndex = tonumber(UI.items.LanguageCombo.CurrentIndex or 0) or 0
         return {
+            asr_model = UI.selectedASRModel().key,
             language = Config.LANGUAGES[languageIndex + 1] or "Auto",
             prompt = UI.items.PromptEdit.PlainText or "",
             max_chars = tonumber(UI.items.MaxChars.Value) or 42,
@@ -2247,6 +2258,13 @@ do
     end
 
     function UI.applySettings(values)
+        local modelIndex = 0
+        for candidate, model in ipairs(Config.ASR_MODELS) do
+            if model.key == values.asr_model then
+                modelIndex = candidate - 1
+                break
+            end
+        end
         local index = 0
         for candidate, language in ipairs(Config.LANGUAGES) do
             if language == values.language then
@@ -2254,6 +2272,7 @@ do
                 break
             end
         end
+        UI.items.ModelCombo.CurrentIndex = modelIndex
         UI.items.LanguageCombo.CurrentIndex = index
         UI.items.PromptEdit.PlainText = values.prompt or ""
         UI.items.MaxChars.Value = tonumber(values.max_chars) or 42
@@ -2262,17 +2281,30 @@ do
         UI.applyLanguage(values.ui_language)
     end
 
-    function UI.modelsReady(models)
+    function UI.selectedASRModel()
+        local combo = UI.items and UI.items.ModelCombo or nil
+        local index = tonumber(combo and combo.CurrentIndex or 0) or 0
+        return Config.ASR_MODELS[index + 1] or Config.ASR_MODELS[1]
+    end
+
+    function UI.modelsReady(models, asrModel)
         models = type(models) == "table" and models or {}
-        return models.asr == "Ready" and models.forced_aligner == "Ready"
+        local selected = asrModel or UI.selectedASRModel()
+        return models[selected.key] == "Ready" and models.forced_aligner == "Ready"
     end
 
     function UI.setModelStatus(models)
         if not UI.items or not UI.items.ModelStatus then
             return
         end
-        local state = UI.modelsReady(models) and UI.text("Installed") or UI.text("NotInstalled")
+        models = type(models) == "table" and models or {}
+        local selected = UI.selectedASRModel()
+        local state = models[selected.key] == "Ready"
+            and UI.text("Installed") or UI.text("NotInstalled")
         UI.items.ModelStatus.Text = (UI.currentLanguage == "cn" and "状态：" or "Status: ") .. state
+        if UI.items.CreateSubtitles and not Core.job then
+            UI.items.CreateSubtitles.Enabled = UI.modelsReady(models, selected)
+        end
     end
 
     function UI.refreshRuntimeStatus()
@@ -2382,11 +2414,20 @@ do
         if not UI.ensureRuntime() then
             return
         end
+        local selectedModel = UI.selectedASRModel()
+        local runtime = Core.runtimeStatus or {}
+        local runtimeModels = type(runtime.model_status) == "table" and runtime.model_status or {}
+        if runtimeModels[selectedModel.key] == nil then
+            Utils.logError("RUNTIME_MODEL_UNSUPPORTED", "model=" .. selectedModel.key)
+            UI.setStatusKey("runtime_model_unsupported")
+            return
+        end
         local jobId = Utils.generateJobId("models")
         local submitted = UI.submitRequest({
             protocol = Config.PROTOCOL_VERSION,
             job_id = jobId,
             action = "download_models",
+            asr_model = selectedModel.key,
             audio_path = "",
             language = "Auto",
             prompt = "",
@@ -2481,7 +2522,7 @@ do
         end
         local runtime = Core.runtimeStatus or {}
         local models = runtime.model_status or {}
-        if not UI.modelsReady(models) then
+        if not UI.modelsReady(models, { key = settings.asr_model }) then
             UI.setStatusKey("model_required")
             return
         end
@@ -2543,6 +2584,7 @@ do
             protocol = Config.PROTOCOL_VERSION,
             job_id = job.id,
             action = "transcribe",
+            asr_model = job.settings.asr_model,
             audio_path = audioPath,
             language = job.settings.language,
             prompt = job.settings.prompt,
@@ -3432,7 +3474,9 @@ do
         local runtime = Core.runtimeStatus or Utils.runtimeStatus() or {}
         local value = runtime.diagnostics or {}
         local performance = type(value.performance) == "table" and value.performance or {}
-        local modelInstalled = value.asr_model == "Ready" and value.aligner_model == "Ready"
+        local selectedModel = UI.selectedASRModel()
+        local runtimeModels = type(runtime.model_status) == "table" and runtime.model_status or {}
+        local modelInstalled = UI.modelsReady(runtimeModels, selectedModel)
         local modelState = modelInstalled and UI.text("Installed") or UI.text("NotInstalled")
         local separator = UI.currentLanguage == "cn" and "：" or ": "
         local diagnosticValueKeys = {
@@ -3486,7 +3530,7 @@ do
             line("DiagnosticsGPU", value.gpu, "DiagnosticsUnknown"),
             line("DiagnosticsDtype", value.dtype, "DiagnosticsUnknown"),
             "",
-            line("DiagnosticsModel", "Qwen3-ASR-0.6B · " .. modelState, "DiagnosticsUnknown"),
+            line("DiagnosticsModel", selectedModel.label .. " · " .. modelState, "DiagnosticsUnknown"),
             "",
             line("DiagnosticsLastJob", value.last_job, "DiagnosticsNone"),
             line("DiagnosticsCachePolicy", runtime.engine_cache_policy, "DiagnosticsUnknown"),
@@ -3593,6 +3637,17 @@ do
         end
         window.On.CreateSubtitles.Clicked = UI.guard("CREATE_CLICK_FAILED", UI.startCreateSubtitles)
         window.On.DownloadModels.Clicked = UI.guard("DOWNLOAD_CLICK_FAILED", UI.startDownloadModels)
+        window.On.ModelCombo.CurrentIndexChanged = UI.guard("MODEL_CHANGE_FAILED", function()
+            App.Settings:save(UI.collectSettings())
+            local runtime = Core.runtimeStatus or {}
+            local models = type(runtime.model_status) == "table" and runtime.model_status or {}
+            UI.setModelStatus(models)
+            if UI.modelsReady(models) then
+                UI.setStatusKey("ready_help")
+            else
+                UI.setStatusKey("model_required")
+            end
+        end)
         window.On.Cancel.Clicked = UI.guard("CANCEL_CLICK_FAILED", UI.cancelCurrentJob)
         window.On.SubtitleTree.ItemClicked = UI.guard("TREE_CLICK_FAILED", UI.selectTreeItem)
         window.On.SubtitleEditor.TextChanged = UI.guard("EDITOR_CHANGE_FAILED", UI._on_subtitle_editor_text_changed)
@@ -3628,7 +3683,7 @@ do
     function UI.run()
         UI.window = UI.buildMainWindow()
         UI.items = UI.window:GetItems()
-        UI.items.ModelCombo:AddItems({ "Qwen3-ASR-0.6B" })
+        UI.items.ModelCombo:AddItems({ "Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B" })
         UI.items.ModelCombo.CurrentIndex = 0
         UI.items.LanguageCombo:AddItems(Config.LANGUAGE_LABELS.cn)
         UI.items.SubtitleTree:SetHeaderLabels({ "#", "Start", "End", "Subtitle" })

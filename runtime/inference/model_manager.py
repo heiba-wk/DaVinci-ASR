@@ -25,8 +25,13 @@ from runtime.ipc.atomic import atomic_write_json, read_json
 
 HF_REPO_ID = "Qwen/Qwen3-ASR-0.6B-hf"
 MS_REPO_ID = "Qwen/Qwen3-ASR-0.6B-hf"
+HF_1_7B_REPO_ID = "Qwen/Qwen3-ASR-1.7B-hf"
+MS_1_7B_REPO_ID = "Qwen/Qwen3-ASR-1.7B-hf"
 MS_ALIGNER_REPO_ID = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
-MODELSCOPE_REPO_IDS = frozenset((MS_REPO_ID, MS_ALIGNER_REPO_ID))
+MODELSCOPE_REPO_IDS = frozenset(
+    (MS_REPO_ID, MS_1_7B_REPO_ID, MS_ALIGNER_REPO_ID)
+)
+ASR_REPO_IDS = frozenset((HF_REPO_ID, HF_1_7B_REPO_ID))
 INCOMPLETE_MARKER = ".download_incomplete"
 REPORT_INTERVAL_SECONDS = 0.15
 PROXY_ENV_KEYS = (
@@ -969,13 +974,20 @@ class ModelManager:
         *,
         ui_language: str = "en",
         source: str | None = None,
+        model_keys: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         if source is not None and source not in {"huggingface", "modelscope"}:
             raise ValueError(f"Unsupported model source: {source}")
         self.invalidate_cache()
         cancelled = is_cancelled or (lambda: False)
+        if model_keys is None:
+            selected_entries = list(self.manifest["models"])
+        else:
+            selected_entries = [
+                self.model_entry(key) for key in dict.fromkeys(model_keys)
+            ]
         pending: list[tuple[dict[str, Any], Path]] = []
-        for entry in self.manifest["models"]:
+        for entry in selected_entries:
             external_root = self.paths.models / entry["directory"]
             self._repair_completed_marker(entry, external_root)
             ready, _ = self.verify(entry["key"], full_hash=True)
@@ -1008,7 +1020,7 @@ class ModelManager:
                     self._marker(root).write_text("incomplete\n", encoding="ascii")
                     if source is not None:
                         sources = (source,)
-                    elif entry["key"] == "asr" and entry["repo_id"] == HF_REPO_ID:
+                    elif entry["repo_id"] in ASR_REPO_IDS:
                         sources: tuple[str, ...] = self.source_order(ui_language)
                     else:
                         sources = ("huggingface",)

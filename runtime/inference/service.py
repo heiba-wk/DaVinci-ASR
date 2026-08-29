@@ -32,8 +32,8 @@ class InferenceService:
             policy=cache_policy,
         )
 
-    def acquire_asr(self) -> tuple[Any, float]:
-        return self.engines.acquire("asr", self.models.model_path("asr"))
+    def acquire_asr(self, model_key: str = "asr") -> tuple[Any, float]:
+        return self.engines.acquire("asr", self.models.model_path(model_key))
 
     def acquire_aligner(self) -> tuple[Any, float]:
         return self.engines.acquire(

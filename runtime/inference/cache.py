@@ -108,6 +108,7 @@ class EnginePool:
         if self.policy not in ENGINE_CACHE_POLICIES:
             raise ValueError(f"Unsupported engine cache policy: {self.policy}")
         self._engines: dict[str, Any] = {}
+        self._engine_paths: dict[str, Path] = {}
         self._loaded: set[str] = set()
         self.last_used = 0.0
 
@@ -138,6 +139,12 @@ class EnginePool:
 
         if kind not in self.factories:
             raise KeyError(f"Unknown engine kind: {kind}")
+        path = Path(model_path).resolve()
+        current_path = self._engine_paths.get(kind)
+        if current_path is not None and current_path != path:
+            self._release_engine(kind, clear_processor=True)
+            self._engines.pop(kind, None)
+            self._engine_paths.pop(kind, None)
         if kind in self._loaded:
             self.last_used = time.monotonic()
             return self._engines[kind], 0.0
@@ -147,9 +154,9 @@ class EnginePool:
                     self._release_engine(loaded_kind)
         engine = self._engines.get(kind)
         if engine is None:
-            path = Path(model_path)
             engine = self.factories[kind](path, self.hardware)
             self._engines[kind] = engine
+            self._engine_paths[kind] = path
         if hasattr(engine, "processor") and engine.processor is None:
             engine.processor = self.processor_cache.get(kind, model_path)
         started = time.monotonic()
@@ -189,4 +196,5 @@ class EnginePool:
             if hasattr(engine, "processor"):
                 engine.processor = None
         self._engines.clear()
+        self._engine_paths.clear()
         self.processor_cache.clear()

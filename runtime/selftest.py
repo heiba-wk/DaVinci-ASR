@@ -16,12 +16,12 @@ from runtime.inference.model_manager import ModelManager
 
 
 def run_model_self_test(
-    paths: RuntimePaths, profile: HardwareProfile
+    paths: RuntimePaths, profile: HardwareProfile, *, asr_model: str = "asr"
 ) -> dict[str, str | int]:
     models = ModelManager(paths)
     duration_seconds = 1
     waveform = np.zeros(SAMPLE_RATE * duration_seconds, dtype=np.float32)
-    asr = QwenASREngine(models.model_path("asr"), profile)
+    asr = QwenASREngine(models.model_path(asr_model), profile)
     asr.load()
     try:
         # This intentionally exercises real model generation on the selected device.
@@ -51,11 +51,11 @@ def run_model_self_test(
 
 
 def validate_hardware_with_fallback(
-    paths: RuntimePaths, *, force_cpu: bool = False
+    paths: RuntimePaths, *, force_cpu: bool = False, asr_model: str = "asr"
 ) -> HardwareProfile:
     profile = select_hardware(paths, force_cpu=force_cpu)
     try:
-        run_model_self_test(paths, profile)
+        run_model_self_test(paths, profile, asr_model=asr_model)
         profile.validated = True
         mark_hardware_validated(paths, profile)
         return profile
@@ -64,7 +64,7 @@ def validate_hardware_with_fallback(
             raise
         mark_mps_failed(paths, f"{type(exc).__name__}: {exc}")
         fallback = select_hardware(paths, force_cpu=True)
-        run_model_self_test(paths, fallback)
+        run_model_self_test(paths, fallback, asr_model=asr_model)
         fallback.validated = True
         mark_hardware_validated(paths, fallback)
         return fallback
