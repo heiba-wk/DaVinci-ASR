@@ -38,7 +38,7 @@ do
     end
 
     Config.SCRIPT_NAME = "DaVinci ASR"
-    Config.SCRIPT_VERSION = "1.0.0"
+    Config.SCRIPT_VERSION = "1.0.1"
     Config.MORE_FEATURES_URL = "https://www.heibagen.com/plugins"
     Config.SUPABASE_URL = "https://ctojqwfhfctnwyffcsvc.supabase.co"
     Config.SUPABASE_PUBLISHABLE_KEY = "sb_publishable_1aGEOf370Geh2P0sUTSCQg_Vys3FxWm"
@@ -152,10 +152,8 @@ do
     }
     Config.DEFAULTS = {
         asr_model = "asr",
-        mode = "auto_subtitle",
         language = "Auto",
         prompt = "",
-        reference_text = "",
         max_chars = 42,
         remove_gaps = false,
         trim_end_punctuation = false,
@@ -185,7 +183,7 @@ do
     local Utils = {}
     local Config = App.Config
     local JSON_NULL = {}
-    local errorLogTimes = {}
+    local logTimes = {}
 
     function Utils.joinPath(base, name)
         if base == "" then
@@ -225,27 +223,79 @@ do
         return second == "exit" and third == 0
     end
 
-    function Utils.logError(code, detail)
+    local function escapeLogPattern(value)
+        return tostring(value or ""):gsub("([^%w])", "%%%1")
+    end
+
+    local function sanitizeLogField(value, fallback)
+        local result = tostring(value or "")
+            :gsub("[\r\n\t]+", " ")
+            :gsub("%s+", "_")
+            :gsub("[^%w%._%-]", "_")
+        if result == "" then
+            result = fallback or "unknown"
+        end
+        if #result > 64 then
+            result = result:sub(1, 61) .. "..."
+        end
+        return result
+    end
+
+    local function emitLog(level, code, detail)
+        local safeLevel = tostring(level or "INFO"):upper():gsub("[^A-Z]", "")
+        if safeLevel ~= "ERROR" and safeLevel ~= "INFO" then
+            safeLevel = "INFO"
+        end
         local safeCode = tostring(code or "UNKNOWN_ERROR"):upper():gsub("[^A-Z0-9_%-]", "_")
-        local safeDetail = tostring(detail or "unknown error")
+        local safeDetail = tostring(detail or (safeLevel == "ERROR" and "unknown error" or "none"))
             :gsub("[\r\n\t]+", " ")
             :gsub("%s+", " ")
             :gsub("Bearer%s+[%w%-%._~%+/=]+", "Bearer [redacted]")
             :gsub("sb_[%w_%-]+", "sb_[redacted]")
             :gsub("hf_[%w_%-]+", "hf_[redacted]")
             :gsub("sk%-[%w_%-]+", "sk-[redacted]")
+        for _, environmentName in ipairs({ "HOME", "USERPROFILE" }) do
+            local homeDirectory = os.getenv(environmentName)
+            if homeDirectory and homeDirectory ~= "" then
+                safeDetail = safeDetail:gsub(escapeLogPattern(homeDirectory), "<home>")
+            end
+        end
         if #safeDetail > 500 then
             safeDetail = safeDetail:sub(1, 497) .. "..."
         end
-        local signature = safeCode .. "\0" .. safeDetail
+        local signature = safeLevel .. "\0" .. safeCode .. "\0" .. safeDetail
         local now = os.time()
-        local previous = errorLogTimes[signature]
+        local previous = logTimes[signature]
         if previous and now - previous < Config.ERROR_LOG_THROTTLE_SECONDS then
             return false
         end
-        errorLogTimes[signature] = now
-        print(string.format("[DaVinci ASR][ERROR][%s] %s", safeCode, safeDetail))
+        logTimes[signature] = now
+        local runtime = App.Core and type(App.Core.runtimeStatus) == "table"
+            and App.Core.runtimeStatus or {}
+        local hardware = type(runtime.hardware) == "table" and runtime.hardware or {}
+        local platformName = Config.IS_WINDOWS and "windows" or "macos"
+        print(string.format(
+            "[DaVinci ASR][%s][%s] ts=%s version=%s protocol=%s os=%s runtime=%s runtime_version=%s backend=%s detail=%s",
+            safeLevel,
+            safeCode,
+            os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            sanitizeLogField(Config.SCRIPT_VERSION),
+            sanitizeLogField(Config.PROTOCOL_VERSION),
+            platformName,
+            sanitizeLogField(Config.RUNTIME_KIND),
+            sanitizeLogField(runtime.runtime_version, "offline"),
+            sanitizeLogField(runtime.backend or hardware.backend, "offline"),
+            safeDetail
+        ))
         return true
+    end
+
+    function Utils.logInfo(code, detail)
+        return emitLog("INFO", code, detail)
+    end
+
+    function Utils.logError(code, detail)
+        return emitLog("ERROR", code, detail)
     end
 
     function Utils.trim(value)
@@ -1004,7 +1054,7 @@ do
         local stored, loadError = Utils.readJson(Config.SETTINGS_FILE)
         if type(stored) == "table" then
             for key, defaultValue in pairs(Config.DEFAULTS) do
-                if key ~= "reference_text" and type(stored[key]) == type(defaultValue) then
+                if type(stored[key]) == type(defaultValue) then
                     values[key] = stored[key]
                 end
             end
@@ -1018,7 +1068,6 @@ do
         local source = values or Config.DEFAULTS
         local payload = {
             asr_model = tostring(source.asr_model or "asr"),
-            mode = source.mode == "script_match" and "script_match" or "auto_subtitle",
             language = tostring(source.language or "Auto"),
             prompt = tostring(source.prompt or ""),
             max_chars = tonumber(source.max_chars) or 42,
@@ -1603,9 +1652,6 @@ do
         downloadSourceItems = nil,
         diagnosticsWindow = nil,
         diagnosticsItems = nil,
-        _referenceText = "",
-        _scriptMatchPreviousText = "",
-        _scriptMatchWindowOpen = false,
         _statusKey = "ready_help",
         _statusArgs = {},
         _lastDownloadStatus = nil,
@@ -1615,6 +1661,9 @@ do
         _startupUpdateTick = 0,
         _runtimeLaunchStartedAt = nil,
         _runtimeStartFailureReported = false,
+        _runtimeStatusReadFailureReported = false,
+        _runtimeProtocolMismatch = nil,
+        _runtimeConnectionState = nil,
         _startupSubtitleLoadPending = false,
         _subtitle_blocks_state = {},
         subtitleStartFrame = nil,
@@ -1644,16 +1693,12 @@ do
 
     local STATUS_MESSAGES = {
         ready_help = {
-            cn = "就绪：选语言后创建字幕。",
-            en = "Ready: choose a language, then create subtitles."
+            cn = "",
+            en = ""
         },
         reference_required = {
-            cn = "文稿匹配需要至少一行非空文稿。",
-            en = "Script Match requires at least one non-empty script line."
-        },
-        script_match_ready = {
-            cn = "文稿匹配已启用：每个非空行将生成一个字幕块。",
-            en = "Script Match enabled: each non-empty line becomes one subtitle block."
+            cn = "请先粘贴文稿。",
+            en = "Paste a script first."
         },
         enter_find_text = { cn = "请输入查找文字。", en = "Enter text to find." },
         matches_rows_occ = { cn = "%d 条字幕，%d 处匹配。", en = "%d rows, %d matches." },
@@ -1685,9 +1730,6 @@ do
             en = "Could not export timeline audio: %s"
         },
         subtitle_progress = { cn = "正在创建字幕 %d%%…", en = "Creating subtitles %d%%…" },
-        no_task = { cn = "当前没有任务。", en = "No task is running." },
-        render_cancelled = { cn = "音频导出已取消。", en = "Audio export cancelled." },
-        cancel_requested = { cn = "正在取消任务…", en = "Cancelling task…" },
         srt_import_failed = { cn = "字幕已生成，但导入失败。", en = "Subtitles created, but import failed." },
         subtitles_created = { cn = "字幕已创建并导入 · 100%", en = "Subtitles created and imported · 100%" },
         subtitles_created_partial = {
@@ -1705,6 +1747,35 @@ do
         diagnostics_copied = { cn = "诊断信息已复制。", en = "Diagnostics copied." }
     }
 
+    local STATUS_VISIBLE_KEYS = {
+        subtitle_progress = true,
+        subtitles_created_partial = true,
+        enter_find_text = true,
+        matches_rows_occ = true,
+        no_find_results = true,
+        match_progress = true,
+        replace_no_find = true,
+        no_replace = true,
+        replace_done = true,
+        reference_required = true,
+        runtime_start_failed = true,
+        runtime_missing_help = true,
+        request_write_failed = true,
+        model_source_invalid = true,
+        runtime_model_unsupported = true,
+        model_download_failed = true,
+        model_required = true,
+        timeline_prepare_failed = true,
+        render_start_failed = true,
+        srt_import_failed = true,
+        runtime_invalid_state = true,
+        result_unreadable = true,
+        runtime_error = true,
+        render_failed = true,
+        edited_srt_write_failed = true,
+        edited_subtitles_import_failed = true
+    }
+
     local TRANSLATIONS = {
         cn = {
             TitleLabel = "从音频创建字幕",
@@ -1715,13 +1786,13 @@ do
             RemoveGaps = "字幕无间隙",
             TrimPunctuation = "句末无标点",
             PromptLabel = "短语列表 / 提示",
-            ScriptMatchCheckBox = "文稿匹配",
-            ScriptMatchCheckBoxTip = "勾选后，在独立窗口粘贴并确认按阅读逻辑分行的文稿。",
+            ScriptMatchEntry = "有文稿？使用文稿匹配",
             ScriptMatchWindowTitle = "文稿匹配",
-            ScriptMatchInfo = "请粘贴完整文稿，并按照最终字幕的阅读逻辑预先分行。",
-            ScriptMatchInstructions = "• 每个非空行会原样生成一个字幕块；空行会被忽略。\n• 请在自然停顿、从句或完整短语处换行，避免拆开数字与单位、人名或成对引号。\n• 建议单行不超过 42 个显示单位，并保留原有大小写、数字和标点。\n• 主窗口中的“字幕无间隙”和“句末无标点”会在匹配完成后应用。",
-            ScriptMatchPlaceholder = "在此粘贴已经分行的完整文稿…",
-            ScriptMatchUse = "使用文稿",
+            ScriptMatchInfo = "粘贴已分行的完整文稿，系统将识别音频并自动匹配字幕时间。",
+            ScriptMatchPlaceholder = "在此粘贴完整文稿…",
+            ScriptMatchFormatTip = "格式建议：每个非空行将生成一个字幕块，请尽量在自然停顿或完整短语处换行。",
+            ScriptMatchValidation = "请先粘贴文稿。",
+            ScriptMatchStart = "开始匹配",
             ScriptMatchCancel = "取消",
             DownloadModels = "模型下载",
             DownloadSourceWindowTitle = "选择模型下载源",
@@ -1759,7 +1830,6 @@ do
             DiagnosticsMilliseconds = "毫秒",
             DiagnosticsBytes = "字节",
             CreateSubtitles = "创建字幕",
-            Cancel = "取消",
             UpdateSubtitles = "更新字幕",
             FindButton = "查找下一个",
             SingleReplaceButton = "替换",
@@ -1782,13 +1852,13 @@ do
             RemoveGaps = "No Gaps",
             TrimPunctuation = "No End Marks",
             PromptLabel = "Phrases / Prompt",
-            ScriptMatchCheckBox = "Script Match",
-            ScriptMatchCheckBoxTip = "Open a separate window to paste and confirm a script split for natural reading.",
+            ScriptMatchEntry = "Have a script? Use Script Match",
             ScriptMatchWindowTitle = "Script Match",
-            ScriptMatchInfo = "Paste the complete script and split it into the final subtitle reading units.",
-            ScriptMatchInstructions = "• Each non-empty line becomes one subtitle block verbatim; empty lines are ignored.\n• Break at natural pauses, clauses, or complete phrases; keep numbers with units, names, and paired quotes together.\n• Keep each line within 42 display units and preserve the original case, numbers, and punctuation.\n• “No Gaps” and “No End Marks” from the main window are applied after matching.",
-            ScriptMatchPlaceholder = "Paste the complete line-broken script here…",
-            ScriptMatchUse = "Use Script",
+            ScriptMatchInfo = "Paste your complete line-broken script. The audio will be recognized and aligned to your text.",
+            ScriptMatchPlaceholder = "Paste your script here...",
+            ScriptMatchFormatTip = "Formatting tip: each non-empty line becomes one subtitle block. Break lines at natural pauses or complete phrases.",
+            ScriptMatchValidation = "Paste a script first.",
+            ScriptMatchStart = "Start Match",
             ScriptMatchCancel = "Cancel",
             DownloadModels = "Download Models",
             DownloadSourceWindowTitle = "Choose Model Download Source",
@@ -1826,7 +1896,6 @@ do
             DiagnosticsMilliseconds = "ms",
             DiagnosticsBytes = "bytes",
             CreateSubtitles = "Create Subtitles",
-            Cancel = "Cancel",
             UpdateSubtitles = "Update Subtitles",
             FindButton = "Find Next",
             SingleReplaceButton = "Replace",
@@ -1847,7 +1916,7 @@ do
         return Core.dispatcher:AddWindow({
             ID = Config.WINDOW_ID,
             WindowTitle = Config.SCRIPT_NAME .. " " .. Config.SCRIPT_VERSION,
-            Geometry = { 430, 190, 880, 620 },
+            Geometry = { 450, 210, 840, 580 },
             Spacing = 10,
             StyleSheet = "*{font-size:14px;}"
         }, ui:VGroup{
@@ -1866,27 +1935,10 @@ do
                     ui:VGap(5),
                     ui:HGroup{
                         Weight = 0,
-                        ui:Label{ ID = "ModelLabel", Text = "模型", Weight = 0.24 },
-                        ui:ComboBox{ ID = "ModelCombo", Weight = 0.50 },
-                        ui:Label{
-                            ID = "ModelStatus",
-                            Text = "状态：未安装",
-                            Alignment = { AlignRight = true, AlignVCenter = true },
-                            Weight = 0.26
-                        }
+                        ui:Label{ ID = "ModelLabel", Text = "模型", Weight = 0.4 },
+                        ui:ComboBox{ ID = "ModelCombo", Weight = 0.6 }
                     },
                     ui:Button{ ID = "DownloadModels", Text = "模型下载", Weight = 0 },
-                    ui:HGroup{
-                        Weight = 0,
-                        ui:CheckBox{
-                            ID = "ScriptMatchCheckBox",
-                            Text = "文稿匹配",
-                            ToolTip = "勾选后，在独立窗口粘贴并确认按阅读逻辑分行的文稿。",
-                            Checked = false,
-                            Weight = 0
-                        },
-                        ui:Label{ Text = "", Weight = 1 }
-                    },
                     ui:HGroup{
                         Weight = 0,
                         ui:Label{ ID = "LangLabel", Text = "语言", Weight = 0.4 },
@@ -1914,17 +1966,25 @@ do
                     ui:TextEdit{ ID = "PromptEdit", PlaceholderText = "人名、术语和上下文提示…", Weight = 0.1 },
                     ui:Label{
                         ID = "StatusLabel",
-                        Text = "就绪：选语言后创建字幕。",
-                        WordWrap = false,
+                        Text = "",
+                        WordWrap = true,
                         StyleSheet = "",
                         Alignment = { AlignHCenter = true, AlignVCenter = true },
                         Font = ui:Font{ PixelSize = 12 },
                         Weight = 0.1
                     },
-                    ui:HGroup{
+                    ui:VGroup{
                         Weight = 0,
-                        ui:Button{ ID = "CreateSubtitles", Text = "创建字幕", Weight = 0.72 },
-                        ui:Button{ ID = "Cancel", Text = "取消", Enabled = false, Weight = 0.28 }
+                        Spacing = 2,
+                        ui:Button{
+                            ID = "ScriptMatchEntry",
+                            Text = "有文稿？使用文稿匹配",
+                            Alignment = { AlignHCenter = true, AlignVCenter = true },
+                            Font = ui:Font{ PixelSize = 12, Underline = true },
+                            Flat = true,
+                            Weight = 0
+                        },
+                        ui:Button{ ID = "CreateSubtitles", Text = "创建字幕", Weight = 0 }
                     }
                 },
                 ui:VGroup{
@@ -2030,6 +2090,10 @@ do
                 UI.items.StatusLabel.StyleSheet = "color:#e05252; font-weight:bold;"
                 return
             end
+        end
+        if not STATUS_VISIBLE_KEYS[UI._statusKey] then
+            UI.items.StatusLabel.Text = ""
+            return
         end
         local messages = STATUS_MESSAGES[UI._statusKey] or STATUS_MESSAGES.ready_help
         local template = messages[UI.currentLanguage] or messages.cn
@@ -2159,47 +2223,19 @@ do
         return tostring(value or ""):find("%S") ~= nil
     end
 
-    function UI.referenceText()
-        return tostring(UI._referenceText or "")
-    end
-
-    function UI.selectedMode()
-        local checked = UI.items
-            and UI.items.ScriptMatchCheckBox
-            and UI.items.ScriptMatchCheckBox.Checked == true
-        if checked and UI.hasReferenceText(UI.referenceText()) then
-            return "script_match"
-        end
-        return "auto_subtitle"
-    end
-
-    function UI.updateModeControls()
-        if not UI.items then
-            return
-        end
-        local scriptMatch = UI.selectedMode() == "script_match"
-        for _, id in ipairs({ "PromptLabel", "PromptEdit" }) do
-            if UI.items[id] then
-                UI.items[id].Enabled = not scriptMatch
-            end
-        end
-        for _, id in ipairs({ "MaxCharsLabel", "MaxChars" }) do
-            if UI.items[id] then
-                UI.items[id].Enabled = not scriptMatch
-            end
-        end
-    end
-
     function UI.refreshScriptMatchWindowLanguage()
         if not UI.scriptMatchWindow or not UI.scriptMatchItems then
             return
         end
         UI.scriptMatchWindow.WindowTitle = UI.text("ScriptMatchWindowTitle")
         UI.scriptMatchItems.ScriptMatchInfo.Text = UI.text("ScriptMatchInfo")
-        UI.scriptMatchItems.ScriptMatchInstructions.Text = UI.text("ScriptMatchInstructions")
+        UI.scriptMatchItems.ScriptMatchFormatTip.Text = UI.text("ScriptMatchFormatTip")
         UI.scriptMatchItems.ScriptMatchTextEdit.PlaceholderText = UI.text("ScriptMatchPlaceholder")
-        UI.scriptMatchItems.ScriptMatchUse.Text = UI.text("ScriptMatchUse")
+        UI.scriptMatchItems.ScriptMatchStart.Text = UI.text("ScriptMatchStart")
         UI.scriptMatchItems.ScriptMatchCancel.Text = UI.text("ScriptMatchCancel")
+        if UI.scriptMatchItems.ScriptMatchValidation.Text ~= "" then
+            UI.scriptMatchItems.ScriptMatchValidation.Text = UI.text("ScriptMatchValidation")
+        end
     end
 
     function UI.ensureScriptMatchWindow()
@@ -2210,7 +2246,7 @@ do
         local dialog = Core.dispatcher:AddWindow({
             ID = Config.SCRIPT_MATCH_WINDOW_ID,
             WindowTitle = UI.text("ScriptMatchWindowTitle"),
-            Geometry = { 430, 190, 880, 620 },
+            Geometry = { 450, 210, 840, 580 },
             Spacing = 10,
             StyleSheet = "*{font-size:14px;}"
         }, ui:VGroup{
@@ -2218,112 +2254,99 @@ do
             ui:Label{
                 ID = "ScriptMatchInfo",
                 Text = UI.text("ScriptMatchInfo"),
-                Alignment = { AlignHCenter = true, AlignVCenter = true },
+                Alignment = { AlignLeft = true, AlignVCenter = true },
                 WordWrap = true,
                 Weight = 0
             },
-            ui:HGroup{
-                Spacing = 12,
-                Weight = 1,
-                ui:VGroup{
-                    Weight = 65,
-                    ui:TextEdit{
-                        ID = "ScriptMatchTextEdit",
-                        PlainText = UI.referenceText(),
-                        PlaceholderText = UI.text("ScriptMatchPlaceholder"),
-                        StyleSheet = "*{font-size:16px;}",
-                        Weight = 1
-                    }
-                },
-                ui:VGroup{
-                    Weight = 35,
-                    ui:Label{
-                        ID = "ScriptMatchInstructions",
-                        Text = UI.text("ScriptMatchInstructions"),
-                        WordWrap = true,
-                        Alignment = { AlignLeft = true, AlignTop = true },
-                        Weight = 0
-                    },
-                    ui:Label{ Text = "", Weight = 1 }
-                }
+            ui:TextEdit{
+                ID = "ScriptMatchTextEdit",
+                PlainText = "",
+                PlaceholderText = UI.text("ScriptMatchPlaceholder"),
+                StyleSheet = "*{font-size:16px;}",
+                Weight = 1
+            },
+            ui:Label{
+                ID = "ScriptMatchFormatTip",
+                Text = UI.text("ScriptMatchFormatTip"),
+                WordWrap = true,
+                Alignment = { AlignLeft = true, AlignVCenter = true },
+                Weight = 0
+            },
+            ui:Label{
+                ID = "ScriptMatchValidation",
+                Text = "",
+                StyleSheet = "color:#e05252;",
+                Alignment = { AlignLeft = true, AlignVCenter = true },
+                Weight = 0
             },
             ui:HGroup{
                 Weight = 0,
                 ui:Label{ Text = "", Weight = 1 },
                 ui:Button{ ID = "ScriptMatchCancel", Text = UI.text("ScriptMatchCancel"), Weight = 0 },
-                ui:Button{ ID = "ScriptMatchUse", Text = UI.text("ScriptMatchUse"), Weight = 0 }
+                ui:Button{ ID = "ScriptMatchStart", Text = UI.text("ScriptMatchStart"), Weight = 0 }
             }
         })
         UI.scriptMatchWindow = dialog
         UI.scriptMatchItems = dialog:GetItems()
-        dialog.On.ScriptMatchUse.Clicked = UI.guard("SCRIPT_MATCH_CONFIRM_FAILED", function()
-            UI.closeScriptMatchWindow(true)
-        end)
+        dialog.On.ScriptMatchStart.Clicked = UI.guard("SCRIPT_MATCH_START_FAILED", UI.startScriptMatch)
         dialog.On.ScriptMatchCancel.Clicked = UI.guard("SCRIPT_MATCH_CANCEL_FAILED", function()
-            UI.closeScriptMatchWindow(false)
+            UI.closeScriptMatchWindow()
         end)
         dialog.On[Config.SCRIPT_MATCH_WINDOW_ID].Close = UI.guard("SCRIPT_MATCH_CLOSE_FAILED", function()
-            UI.closeScriptMatchWindow(true)
+            UI.closeScriptMatchWindow()
         end)
         UI.refreshScriptMatchWindowLanguage()
         return true
     end
 
     function UI.showScriptMatchWindow()
+        if Core.job then
+            return false
+        end
         UI.ensureScriptMatchWindow()
-        UI._scriptMatchPreviousText = UI.referenceText()
-        UI.scriptMatchItems.ScriptMatchTextEdit.PlainText = UI.referenceText()
+        UI.scriptMatchItems.ScriptMatchValidation.Text = ""
         UI.refreshScriptMatchWindowLanguage()
         UI.scriptMatchWindow:Show()
         if UI.window then
             UI.window:Hide()
         end
-        UI._scriptMatchWindowOpen = true
         pcall(function()
             UI.scriptMatchItems.ScriptMatchTextEdit:SetFocus("OtherFocusReason")
         end)
         return true
     end
 
-    function UI.closeScriptMatchWindow(acceptDraft)
-        if acceptDraft and UI.scriptMatchItems and UI.scriptMatchItems.ScriptMatchTextEdit then
-            local editor = UI.scriptMatchItems.ScriptMatchTextEdit
-            UI._referenceText = tostring(editor.PlainText or "")
-        elseif not acceptDraft then
-            UI._referenceText = tostring(UI._scriptMatchPreviousText or UI._referenceText or "")
-        end
-        UI._scriptMatchPreviousText = ""
-        local enabled = acceptDraft and UI.hasReferenceText(UI._referenceText)
-        if acceptDraft and not enabled then
-            UI._referenceText = ""
-        end
-        if UI.items and UI.items.ScriptMatchCheckBox then
-            UI.items.ScriptMatchCheckBox.Checked = enabled
-        end
+    function UI.closeScriptMatchWindow()
         if UI.scriptMatchWindow then
             UI.scriptMatchWindow:Hide()
         end
-        UI._scriptMatchWindowOpen = false
         if UI.window then
             UI.window:Show()
         end
-        UI.updateModeControls()
-        App.Settings:save(UI.collectSettings())
-        UI.setStatusKey(enabled and "script_match_ready" or "ready_help")
-        return enabled
+        return true
     end
 
-    function UI.onScriptMatchCheckboxClicked()
-        local checked = UI.items
-            and UI.items.ScriptMatchCheckBox
-            and UI.items.ScriptMatchCheckBox.Checked == true
-        if checked then
-            return UI.showScriptMatchWindow()
+    function UI.startScriptMatch()
+        if Core.job or not UI.scriptMatchItems or not UI.scriptMatchItems.ScriptMatchTextEdit then
+            return false
         end
-        UI.updateModeControls()
-        App.Settings:save(UI.collectSettings())
-        UI.setStatusKey("ready_help")
-        return false
+        local editor = UI.scriptMatchItems.ScriptMatchTextEdit
+        local referenceText = tostring(editor.PlainText or "")
+        if not UI.hasReferenceText(referenceText) then
+            UI.scriptMatchItems.ScriptMatchValidation.Text = UI.text("ScriptMatchValidation")
+            UI.setStatusKey("reference_required")
+            pcall(function()
+                editor:SetFocus("OtherFocusReason")
+            end)
+            return false
+        end
+        UI.scriptMatchItems.ScriptMatchValidation.Text = ""
+        UI.closeScriptMatchWindow()
+        local started = UI.startCreateSubtitles("script_match", referenceText)
+        if started then
+            editor.PlainText = ""
+        end
+        return started
     end
 
     function UI.applyLanguage(language)
@@ -2331,8 +2354,8 @@ do
         local textIds = {
             "TitleLabel", "TreeTitleLabel", "ModelLabel",
             "LangLabel", "MaxCharsLabel", "RemoveGaps",
-            "TrimPunctuation", "PromptLabel", "ScriptMatchCheckBox", "DownloadModels",
-            "CreateSubtitles", "Cancel", "UpdateSubtitles", "FindButton",
+            "TrimPunctuation", "PromptLabel", "ScriptMatchEntry", "DownloadModels",
+            "CreateSubtitles", "UpdateSubtitles", "FindButton",
             "SingleReplaceButton", "AllReplaceButton", "CopyrightButton"
         }
         for _, id in ipairs(textIds) do
@@ -2343,11 +2366,9 @@ do
         UI.items.FindInput.PlaceholderText = UI.text("FindPlaceholder")
         UI.items.ReplaceInput.PlaceholderText = UI.text("ReplacePlaceholder")
         UI.items.PromptEdit.PlaceholderText = UI.text("PromptPlaceholder")
-        UI.items.ScriptMatchCheckBox.ToolTip = UI.text("ScriptMatchCheckBoxTip")
         UI.items.LangEnCheckBox.Checked = UI.currentLanguage == "en"
         UI.items.LangCnCheckBox.Checked = UI.currentLanguage == "cn"
         UI.populateLanguageCombo()
-        UI.updateModeControls()
         UI.refreshRuntimeStatus()
         if Core.job and Core.job.action == "download_models" and UI._lastDownloadStatus then
             UI.items.DownloadModels.Text = UI.downloadButtonText(UI._lastDownloadStatus)
@@ -2444,6 +2465,7 @@ do
         end
         UI._lastDownloadStatus = type(status) == "table" and status or nil
         UI.items.DownloadModels.Text = UI.downloadButtonText(status)
+        UI.items.DownloadModels.Enabled = false
     end
 
     function UI.setIdleDownloadButton()
@@ -2454,7 +2476,11 @@ do
             return
         end
         UI._lastDownloadStatus = nil
-        UI.items.DownloadModels.Text = UI.text("DownloadModels")
+        local runtime = Core.runtimeStatus or {}
+        local models = type(runtime.model_status) == "table" and runtime.model_status or {}
+        local installed = UI.modelsReady(models)
+        UI.items.DownloadModels.Text = installed and UI.text("Installed") or UI.text("DownloadModels")
+        UI.items.DownloadModels.Enabled = not installed
     end
 
     function UI.updateFindStatus(key, ...)
@@ -2467,18 +2493,22 @@ do
 
     function UI.collectSettings()
         local languageIndex = tonumber(UI.items.LanguageCombo.CurrentIndex or 0) or 0
-        local mode = UI.selectedMode()
         return {
             asr_model = UI.selectedASRModel().key,
-            mode = mode,
             language = Config.LANGUAGES[languageIndex + 1] or "Auto",
             prompt = UI.items.PromptEdit.PlainText or "",
-            reference_text = mode == "script_match" and UI.referenceText() or "",
             max_chars = tonumber(UI.items.MaxChars.Value) or 42,
             remove_gaps = UI.items.RemoveGaps.Checked == true,
             trim_end_punctuation = UI.items.TrimPunctuation.Checked == true,
             ui_language = UI.currentLanguage
         }
+    end
+
+    function UI.collectTaskSettings(mode, referenceText)
+        local settings = UI.collectSettings()
+        settings.mode = mode == "script_match" and "script_match" or "auto_subtitle"
+        settings.reference_text = settings.mode == "script_match" and tostring(referenceText or "") or ""
+        return settings
     end
 
     function UI.applySettings(values)
@@ -2499,14 +2529,10 @@ do
         UI.items.ModelCombo.CurrentIndex = modelIndex
         UI.items.LanguageCombo.CurrentIndex = index
         UI.items.PromptEdit.PlainText = values.prompt or ""
-        UI._referenceText = tostring(values.reference_text or "")
-        UI.items.ScriptMatchCheckBox.Checked = values.mode == "script_match"
-            and UI.hasReferenceText(UI._referenceText)
         UI.items.MaxChars.Value = tonumber(values.max_chars) or 42
         UI.items.RemoveGaps.Checked = values.remove_gaps == true
         UI.items.TrimPunctuation.Checked = values.trim_end_punctuation == true
         UI.applyLanguage(values.ui_language)
-        UI.updateModeControls()
     end
 
     function UI.selectedASRModel()
@@ -2521,29 +2547,59 @@ do
         return models[selected.key] == "Ready" and models.forced_aligner == "Ready"
     end
 
-    function UI.setModelStatus(models)
-        if not UI.items or not UI.items.ModelStatus then
+    function UI.updateModelControls(models)
+        if not UI.items then
             return
         end
         models = type(models) == "table" and models or {}
         local selected = UI.selectedASRModel()
-        local state = models[selected.key] == "Ready"
-            and UI.text("Installed") or UI.text("NotInstalled")
-        UI.items.ModelStatus.Text = (UI.currentLanguage == "cn" and "状态：" or "Status: ") .. state
-        if UI.items.CreateSubtitles and not Core.job then
-            UI.items.CreateSubtitles.Enabled = UI.modelsReady(models, selected)
+        local installed = UI.modelsReady(models, selected)
+        if not Core.job then
+            UI.setTaskEntriesEnabled(installed)
+            if UI.items.DownloadModels then
+                UI._lastDownloadStatus = nil
+                UI.items.DownloadModels.Text = installed and UI.text("Installed") or UI.text("DownloadModels")
+                UI.items.DownloadModels.Enabled = not installed
+            end
+        end
+    end
+
+    function UI.setTaskEntriesEnabled(enabled)
+        if not UI.items then
+            return
+        end
+        for _, id in ipairs({ "CreateSubtitles", "ScriptMatchEntry" }) do
+            if UI.items[id] then
+                UI.items[id].Enabled = enabled == true
+            end
         end
     end
 
     function UI.refreshRuntimeStatus()
-        local status = Utils.runtimeStatus()
+        local status, statusError = Utils.runtimeStatus()
+        if type(status) ~= "table" then
+            if Utils.fileExists(Config.RUNTIME_STATUS_FILE)
+                and not UI._runtimeStatusReadFailureReported then
+                UI._runtimeStatusReadFailureReported = true
+                Utils.logError("RUNTIME_STATUS_UNREADABLE", statusError or "Invalid Runtime status payload.")
+            end
+        else
+            UI._runtimeStatusReadFailureReported = false
+        end
         if not Utils.runtimeHeartbeatFresh(status) then
+            if UI._runtimeConnectionState == "online" then
+                Utils.logInfo(
+                    "RUNTIME_OFFLINE",
+                    type(status) == "table" and "reason=heartbeat_stale_or_stopped"
+                        or "reason=status_unavailable"
+                )
+            end
+            UI._runtimeConnectionState = "offline"
             Core.runtimeStatus = nil
             local runtimeText = Utils.fileExists(Config.RUNTIME_EXECUTABLE)
                 and UI.text("RuntimeOffline") or UI.text("RuntimeMissing")
             UI.items.RuntimeStatusButton.Text = "🔴 " .. runtimeText
-            local staleModels = type(status) == "table" and status.model_status or {}
-            UI.setModelStatus(staleModels)
+            UI.updateModelControls({})
             UI.setIdleDownloadButton()
             if UI._runtimeLaunchStartedAt
                 and not UI._runtimeStartFailureReported
@@ -2555,6 +2611,22 @@ do
             return false
         end
         Core.runtimeStatus = status
+        local runtimeConnected = UI._runtimeConnectionState ~= "online"
+        UI._runtimeConnectionState = "online"
+        local runtimeProtocol = status.protocol_version
+        if runtimeProtocol ~= nil and tonumber(runtimeProtocol) ~= Config.PROTOCOL_VERSION then
+            local mismatch = tostring(runtimeProtocol) .. "->" .. tostring(Config.PROTOCOL_VERSION)
+            if UI._runtimeProtocolMismatch ~= mismatch then
+                UI._runtimeProtocolMismatch = mismatch
+                Utils.logError(
+                    "RUNTIME_PROTOCOL_MISMATCH",
+                    "lua_protocol=" .. tostring(Config.PROTOCOL_VERSION)
+                        .. "; runtime_protocol=" .. tostring(runtimeProtocol)
+                )
+            end
+        else
+            UI._runtimeProtocolMismatch = nil
+        end
         UI._runtimeLaunchStartedAt = nil
         UI._runtimeStartFailureReported = false
         local hardware = type(status.hardware) == "table" and status.hardware or {}
@@ -2564,7 +2636,17 @@ do
         end
         UI.items.RuntimeStatusButton.Text = "🟢 " .. backend
         local models = type(status.model_status) == "table" and status.model_status or {}
-        UI.setModelStatus(models)
+        if runtimeConnected then
+            local selected = UI.selectedASRModel()
+            Utils.logInfo(
+                "RUNTIME_ONLINE",
+                "runtime_protocol=" .. tostring(status.protocol_version or "unknown")
+                    .. "; selected_model=" .. tostring(selected.key)
+                    .. "; selected_status=" .. tostring(models[selected.key] or "Unavailable")
+                    .. "; timing_status=" .. tostring(models.forced_aligner or "Unavailable")
+            )
+        end
+        UI.updateModelControls(models)
         UI.setIdleDownloadButton()
         if not Core.job and UI._statusKey == "runtime_starting" then
             UI.setStatusKey("ready_help")
@@ -2589,6 +2671,7 @@ do
         end
         UI._runtimeLaunchStartedAt = os.time()
         UI._runtimeStartFailureReported = false
+        Utils.logInfo("RUNTIME_LAUNCH_REQUESTED", "runtime_kind=" .. tostring(Config.RUNTIME_KIND))
         UI.setStatusKey("runtime_starting")
         return true
     end
@@ -2607,6 +2690,7 @@ do
 
     function UI.submitRequest(request, action)
         local files = UI.jobFiles(request.job_id)
+        local existingJob = Core.job
         Utils.ensureDir(files.directory)
         local written, writeError = Utils.atomicWriteJson(files.request, request)
         if not written then
@@ -2620,10 +2704,25 @@ do
             phase = "waiting",
             files = files,
             lastState = "",
+            lastDownloadState = "",
+            lastProgressBucket = 0,
+            startedAt = existingJob and existingJob.id == request.job_id
+                and existingJob.startedAt or os.time(),
+            lastStatusSeenAt = os.time(),
+            lastStatusLogAt = os.time(),
+            statusMissingReported = false,
             statusReadFailureReported = false
         }
-        UI.items.Cancel.Enabled = true
-        UI.items.CreateSubtitles.Enabled = false
+        local detail = "job_id=" .. tostring(request.job_id)
+            .. "; action=" .. tostring(action)
+            .. "; mode=" .. tostring(request.mode or "unknown")
+            .. "; model=" .. tostring(request.asr_model or "unknown")
+            .. "; language=" .. tostring(request.language or "unknown")
+        if action == "download_models" then
+            detail = detail .. "; source=" .. tostring(request.download_source or "unknown")
+        end
+        Utils.logInfo("JOB_SUBMITTED", detail)
+        UI.setTaskEntriesEnabled(false)
         UI.items.DownloadModels.Enabled = false
         return true
     end
@@ -2744,22 +2843,30 @@ do
         UI.showDownloadSourceWindow()
     end
 
-    function UI.startCreateSubtitles()
-        local settings = UI.collectSettings()
-        App.Settings:save(settings)
-        if settings.mode == "script_match"
-            and not tostring(settings.reference_text or ""):find("%S") then
+    function UI.startCreateSubtitles(mode, referenceText)
+        if Core.job then
+            return false
+        end
+        local settings = UI.collectTaskSettings(mode, referenceText)
+        App.Settings:save(UI.collectSettings())
+        if settings.mode == "script_match" and not UI.hasReferenceText(settings.reference_text) then
             UI.setStatusKey("reference_required")
-            return
+            return false
         end
         if not UI.ensureRuntime() then
-            return
+            return false
         end
         local runtime = Core.runtimeStatus or {}
         local models = runtime.model_status or {}
         if not UI.modelsReady(models, { key = settings.asr_model }) then
+            Utils.logError(
+                "MODEL_NOT_READY",
+                "selected=" .. tostring(settings.asr_model)
+                    .. "; asr_status=" .. tostring(models[settings.asr_model] or "Unavailable")
+                    .. "; aligner_status=" .. tostring(models.forced_aligner or "Unavailable")
+            )
             UI.setStatusKey("model_required")
-            return
+            return false
         end
         UI.beginSubtitleProgress()
         local jobId = Utils.generateJobId("asr")
@@ -2772,7 +2879,7 @@ do
             Utils.logError("TIMELINE_PREPARE_FAILED", detail)
             UI._subtitleOverallProgress = nil
             UI.setStatusKey("timeline_prepare_failed", detail)
-            return
+            return false
         end
         Core.job = {
             id = jobId,
@@ -2780,13 +2887,23 @@ do
             phase = "preparing",
             settings = settings,
             renderState = cacheState,
-            files = UI.jobFiles(jobId)
+            files = UI.jobFiles(jobId),
+            startedAt = os.time(),
+            lastRenderProgressBucket = 0
         }
+        Utils.logInfo(
+            "SUBTITLE_JOB_STARTED",
+            "job_id=" .. tostring(jobId)
+                .. "; mode=" .. tostring(settings.mode)
+                .. "; model=" .. tostring(settings.asr_model)
+                .. "; language=" .. tostring(settings.language)
+        )
         local cachedAudioPath = App.Resolve:existingAudioPath(cacheState)
         if cachedAudioPath then
+            Utils.logInfo("AUDIO_READY", "job_id=" .. tostring(jobId) .. "; source=cache")
             App.Resolve:returnToEditPage()
             UI.submitRenderedAudio(cachedAudioPath)
-            return
+            return Core.job ~= nil
         end
         local renderCallOk, renderState, renderError = pcall(function()
             return App.Resolve:startAudioRender(cacheState)
@@ -2799,14 +2916,15 @@ do
             Utils.logError("RENDER_START_FAILED", detail)
             UI._subtitleOverallProgress = nil
             UI.setStatusKey("render_start_failed", detail)
-            return
+            return false
         end
         Core.job.phase = "rendering"
         Core.job.renderState = renderState
-        UI.items.Cancel.Enabled = true
-        UI.items.CreateSubtitles.Enabled = false
+        Utils.logInfo("AUDIO_RENDER_STARTED", "job_id=" .. tostring(jobId) .. "; source=timeline")
+        UI.setTaskEntriesEnabled(false)
         UI.items.DownloadModels.Enabled = false
         UI.updateRenderSubtitleProgress(0)
+        return true
     end
 
     function UI.submitRenderedAudio(audioPath)
@@ -2845,19 +2963,28 @@ do
             App.Resolve:discardAudioCache(renderState)
             Core.job = nil
             UI._subtitleOverallProgress = nil
-            UI.items.Cancel.Enabled = false
-            UI.items.CreateSubtitles.Enabled = true
-            UI.items.DownloadModels.Enabled = true
+            local runtime = Core.runtimeStatus or {}
+            local models = type(runtime.model_status) == "table" and runtime.model_status or {}
+            UI.updateModelControls(models)
         end
     end
 
     function UI.finishJob(statusKey, ...)
         local args = { ... }
+        local job = Core.job
+        if job then
+            local elapsed = math.max(0, os.time() - (tonumber(job.startedAt) or os.time()))
+            Utils.logInfo(
+                "JOB_FINISHED",
+                "job_id=" .. tostring(job.id)
+                    .. "; action=" .. tostring(job.action)
+                    .. "; outcome=" .. tostring(statusKey or "ready_help")
+                    .. "; elapsed_seconds=" .. tostring(elapsed)
+            )
+        end
         Core.job = nil
         UI._subtitleOverallProgress = nil
-        UI.items.Cancel.Enabled = false
-        UI.items.CreateSubtitles.Enabled = true
-        UI.items.DownloadModels.Enabled = true
+        UI.setTaskEntriesEnabled(true)
         UI.refreshRuntimeStatus()
         UI.setStatusKey(statusKey or "ready_help", unpackValues(args))
     end
@@ -2871,28 +2998,6 @@ do
             Utils.logError("IPC_ACK_WRITE_FAILED", writeError)
         end
         return written
-    end
-
-    function UI.cancelCurrentJob()
-        App.Settings:save(UI.collectSettings())
-        local job = Core.job
-        if not job then
-            UI.setStatusKey("no_task")
-            return
-        end
-        Utils.ensureDir(job.files.directory)
-        local cancelled, cancelError = Utils.atomicWriteText(job.files.cancel, "cancel\n")
-        if not cancelled then
-            Utils.logError("CANCEL_FLAG_WRITE_FAILED", cancelError)
-        end
-        if job.phase == "rendering" then
-            App.Resolve:cancelAudioRender()
-            App.Resolve:discardAudioCache(job.renderState)
-            App.Resolve:returnToEditPage()
-            UI.finishJob("render_cancelled")
-            return
-        end
-        UI.setStatusKey("cancel_requested")
     end
 
     function UI._treeBatchBounds(total, startIndex, batchSize)
@@ -2989,12 +3094,21 @@ do
             UI.finishJob("srt_import_failed", tostring(importError))
             return false
         end
+        Utils.logInfo(
+            "SRT_IMPORTED",
+            "job_id=" .. tostring(job and job.id or "unknown")
+                .. "; subtitle_count=" .. tostring(#UI.blocks)
+        )
         local metrics = type(result.metrics) == "table" and result.metrics or {}
         local uncoveredCount = math.max(
             0,
             math.floor(tonumber(metrics.remaining_coverage_hole_count) or 0)
         )
         if uncoveredCount > 0 then
+            Utils.logError(
+                "SUBTITLE_PARTIAL_RESULT",
+                "action=transcribe; remaining_coverage_hole_count=" .. tostring(uncoveredCount)
+            )
             UI.finishJob("subtitles_created_partial", uncoveredCount)
         else
             UI.finishJob("subtitles_created")
@@ -3036,9 +3150,22 @@ do
                     "RUNTIME_STATUS_UNREADABLE",
                     "action=" .. tostring(job.action) .. "; " .. tostring(statusError)
                 )
+            elseif not Utils.fileExists(job.files.status)
+                and not job.statusMissingReported
+                and os.time() - (tonumber(job.lastStatusSeenAt) or tonumber(job.startedAt) or os.time()) >= 10 then
+                job.statusMissingReported = true
+                Utils.logInfo(
+                    "JOB_WAITING_FOR_STATUS",
+                    "job_id=" .. tostring(job.id)
+                        .. "; action=" .. tostring(job.action)
+                        .. "; elapsed_seconds="
+                        .. tostring(math.max(0, os.time() - (tonumber(job.startedAt) or os.time())))
+                )
             end
             return
         end
+        job.lastStatusSeenAt = os.time()
+        job.statusMissingReported = false
         job.statusReadFailureReported = false
         local state = tostring(status.state or "")
         if not Config.ALLOWED_STATES[state] then
@@ -3047,8 +3174,64 @@ do
             return
         end
         local isDownload = job.action == "download_models"
+        local progress = math.max(0, math.min(100, tonumber(status.progress) or 0))
+        local elapsed = math.max(0, os.time() - (tonumber(job.startedAt) or os.time()))
+        local stateChanged = job.lastState ~= state
+        local lifecycleLogged = false
+        if stateChanged then
+            job.lastState = state
+            Utils.logInfo(
+                "JOB_STATE",
+                "job_id=" .. tostring(job.id)
+                    .. "; action=" .. tostring(job.action)
+                    .. "; state=" .. state
+                    .. "; progress=" .. tostring(math.floor(progress + 0.5))
+                    .. "; elapsed_seconds=" .. tostring(elapsed)
+            )
+            lifecycleLogged = true
+        end
+        local progressBucket = math.floor(progress / 10) * 10
+        if progressBucket > (tonumber(job.lastProgressBucket) or 0) then
+            job.lastProgressBucket = progressBucket
+            if not stateChanged then
+                Utils.logInfo(
+                    "JOB_PROGRESS",
+                    "job_id=" .. tostring(job.id)
+                        .. "; action=" .. tostring(job.action)
+                        .. "; state=" .. state
+                        .. "; progress=" .. tostring(progressBucket)
+                        .. "; elapsed_seconds=" .. tostring(elapsed)
+                )
+                lifecycleLogged = true
+            end
+        end
         if isDownload then
+            local downloadState = tostring(status.download_status or "")
+            if downloadState ~= "" and job.lastDownloadState ~= downloadState then
+                job.lastDownloadState = downloadState
+                Utils.logInfo(
+                    "DOWNLOAD_STATE",
+                    "job_id=" .. tostring(job.id)
+                        .. "; state=" .. downloadState
+                        .. "; source=" .. tostring(status.download_source or "unknown")
+                        .. "; progress=" .. tostring(math.floor(progress + 0.5))
+                )
+                lifecycleLogged = true
+            end
             UI.updateDownloadButton(status)
+        end
+        if lifecycleLogged then
+            job.lastStatusLogAt = os.time()
+        elseif os.time() - (tonumber(job.lastStatusLogAt) or os.time()) >= 60 then
+            job.lastStatusLogAt = os.time()
+            Utils.logInfo(
+                "JOB_HEARTBEAT",
+                "job_id=" .. tostring(job.id)
+                    .. "; action=" .. tostring(job.action)
+                    .. "; state=" .. state
+                    .. "; progress=" .. tostring(math.floor(progress + 0.5))
+                    .. "; elapsed_seconds=" .. tostring(elapsed)
+            )
         end
         UI.updateRuntimeTaskStatus(status, isDownload)
         if state == "done" then
@@ -3114,6 +3297,11 @@ do
                 Utils.logError("STARTUP_SUBTITLE_LOAD_FAILED", loaded)
             elseif not loaded and loadError then
                 Utils.logError("STARTUP_SUBTITLE_LOAD_FAILED", loadError)
+            elseif loaded then
+                Utils.logInfo(
+                    "STARTUP_SUBTITLES_LOADED",
+                    "subtitle_count=" .. tostring(#(UI.blocks or {}))
+                )
             end
         end
         local job = Core.job
@@ -3132,6 +3320,16 @@ do
                 return
             end
             UI.updateRenderSubtitleProgress(progress)
+            local renderProgressBucket = math.floor(math.max(0, math.min(100, tonumber(progress) or 0)) / 25) * 25
+            if renderProgressBucket > (tonumber(job.lastRenderProgressBucket) or 0)
+                and renderProgressBucket < 100 then
+                job.lastRenderProgressBucket = renderProgressBucket
+                Utils.logInfo(
+                    "AUDIO_RENDER_PROGRESS",
+                    "job_id=" .. tostring(job.id)
+                        .. "; progress=" .. tostring(renderProgressBucket)
+                )
+            end
             if done then
                 App.Resolve:returnToEditPage()
                 if renderError then
@@ -3139,6 +3337,7 @@ do
                     Utils.logError("RENDER_FAILED", renderError)
                     UI.finishJob("render_failed", tostring(renderError))
                 else
+                    Utils.logInfo("AUDIO_READY", "job_id=" .. tostring(job.id) .. "; source=render")
                     UI.submitRenderedAudio(audioPath)
                 end
             end
@@ -3820,12 +4019,23 @@ do
         UI.diagnosticsWindow:Show()
         UI.diagnosticsItems.DiagnosticsText:SelectAll()
         UI.diagnosticsItems.DiagnosticsText:Copy()
+        Utils.logInfo(
+            "DIAGNOSTICS_COPIED",
+            "runtime_online=" .. tostring(UI._runtimeConnectionState == "online")
+        )
         UI.setStatusKey("diagnostics_copied")
     end
 
     function UI.bindEvents()
         local window = UI.window
         window.On[Config.WINDOW_ID].Close = function()
+            local activeJob = Core.job
+            Utils.logInfo(
+                "SESSION_STOP",
+                "active_job=" .. tostring(activeJob ~= nil)
+                    .. "; job_id=" .. tostring(activeJob and activeJob.id or "none")
+                    .. "; action=" .. tostring(activeJob and activeJob.action or "none")
+            )
             local saveCallOk, saveError = pcall(function()
                 return App.Settings:save(UI.collectSettings())
             end)
@@ -3834,10 +4044,17 @@ do
             end
             if Core.job then
                 local job = Core.job
-                pcall(function()
-                    Utils.ensureDir(job.files.directory)
-                    Utils.atomicWriteText(job.files.cancel, "cancel\n")
+                local cancelCallOk, cancelWritten, cancelError = pcall(function()
+                    if not Utils.ensureDir(job.files.directory) then
+                        return false, "Could not create the IPC job directory."
+                    end
+                    return Utils.atomicWriteText(job.files.cancel, "cancel\n")
                 end)
+                if not cancelCallOk then
+                    Utils.logError("CANCEL_FLAG_WRITE_FAILED", cancelWritten)
+                elseif not cancelWritten then
+                    Utils.logError("CANCEL_FLAG_WRITE_FAILED", cancelError)
+                end
                 if job.phase == "rendering" then
                     pcall(function()
                         App.Resolve:cancelAudioRender()
@@ -3855,6 +4072,15 @@ do
             if not temporaryDataCleaned then
                 Utils.logError("TEMP_CLEANUP_FAILED", temporaryDataError)
             end
+            if runtimeStopped then
+                Core.runtimeStatus = nil
+                UI._runtimeConnectionState = "offline"
+            end
+            Utils.logInfo(
+                "SESSION_CLOSED",
+                "runtime_stopped=" .. tostring(runtimeStopped)
+                    .. "; temporary_data_cleaned=" .. tostring(temporaryDataCleaned)
+            )
             if Core.timer then
                 pcall(function()
                     Core.timer:Stop()
@@ -3877,27 +4103,25 @@ do
             end
             Core.dispatcher:ExitLoop()
         end
-        window.On.CreateSubtitles.Clicked = UI.guard("CREATE_CLICK_FAILED", UI.startCreateSubtitles)
+        window.On.CreateSubtitles.Clicked = UI.guard("CREATE_CLICK_FAILED", function()
+            UI.startCreateSubtitles("auto_subtitle", "")
+        end)
+        window.On.ScriptMatchEntry.Clicked = UI.guard("SCRIPT_MATCH_OPEN_FAILED", UI.showScriptMatchWindow)
         window.On.DownloadModels.Clicked = UI.guard("DOWNLOAD_CLICK_FAILED", UI.startDownloadModels)
         window.On.ModelCombo.CurrentIndexChanged = UI.guard("MODEL_CHANGE_FAILED", function()
             App.Settings:save(UI.collectSettings())
             local runtime = Core.runtimeStatus or {}
             local models = type(runtime.model_status) == "table" and runtime.model_status or {}
-            UI.setModelStatus(models)
+            UI.updateModelControls(models)
             if UI.modelsReady(models) then
                 UI.setStatusKey("ready_help")
             else
                 UI.setStatusKey("model_required")
             end
         end)
-        window.On.ScriptMatchCheckBox.Clicked = UI.guard(
-            "SCRIPT_MATCH_CHECKBOX_FAILED",
-            UI.onScriptMatchCheckboxClicked
-        )
         window.On.LanguageCombo.CurrentIndexChanged = UI.guard("LANGUAGE_CHANGE_FAILED", function()
             App.Settings:save(UI.collectSettings())
         end)
-        window.On.Cancel.Clicked = UI.guard("CANCEL_CLICK_FAILED", UI.cancelCurrentJob)
         window.On.SubtitleTree.ItemClicked = UI.guard("TREE_CLICK_FAILED", UI.selectTreeItem)
         window.On.SubtitleEditor.TextChanged = UI.guard("EDITOR_CHANGE_FAILED", UI._on_subtitle_editor_text_changed)
         window.On.FindInput.TextChanged = UI.guard("FIND_CHANGE_FAILED", UI._on_find_input_text_changed)
@@ -3936,7 +4160,18 @@ do
         UI.items.ModelCombo.CurrentIndex = 0
         UI.items.LanguageCombo:AddItems(Config.LANGUAGE_LABELS.cn)
         UI.items.SubtitleTree:SetHeaderLabels({ "#", "Start", "End", "Subtitle" })
+        Utils.logInfo(
+            "SESSION_START",
+            "runtime_available=" .. tostring(Utils.fileExists(Config.RUNTIME_EXECUTABLE))
+        )
         UI.applySettings(App.Settings:load())
+        local languageIndex = tonumber(UI.items.LanguageCombo.CurrentIndex or 0) or 0
+        Utils.logInfo(
+            "UI_READY",
+            "ui_language=" .. tostring(UI.currentLanguage)
+                .. "; selected_model=" .. tostring(UI.selectedASRModel().key)
+                .. "; language=" .. tostring(Config.LANGUAGES[languageIndex + 1] or "Auto")
+        )
         UI.bindEvents()
         Core.timer = Core.ui:Timer{ ID = "DaVinciASRPollTimer", Interval = 150, SingleShot = false }
         UI._startupPhase = "runtime"

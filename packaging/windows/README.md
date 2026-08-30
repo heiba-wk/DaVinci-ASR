@@ -3,7 +3,7 @@
 Run from a clean x64 Windows build machine with Python 3.12 and Inno Setup 6:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging/windows/build_windows.ps1 -Variant all -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File packaging/windows/build_windows.ps1 -Variant all -Version 1.0.1
 ```
 
 Build and release outputs default outside Resolve's `Utility` scan tree under
@@ -25,7 +25,7 @@ targets, macOS can reuse the same pinned, offline Docker/Inno Setup compiler as
 HEIBA AI Studio for the final installer layer:
 
 ```bash
-packaging/windows/build_installer_macos.sh 1.0.0
+packaging/windows/build_installer_macos.sh 1.0.1
 ```
 
 On macOS, point `DAVINCI_ASR_WINDOWS_BUILD_ROOT` at the transferred native

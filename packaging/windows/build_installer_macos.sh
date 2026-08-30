@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WINDOWS_BUILD_ROOT="${DAVINCI_ASR_WINDOWS_BUILD_ROOT:-$HOME/DaVinciASR-Build/windows}"

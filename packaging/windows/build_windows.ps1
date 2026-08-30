@@ -1,7 +1,7 @@
 param(
     [ValidateSet("windows-cpu-x64", "windows-cuda-x64", "all")]
     [string]$Variant = "all",
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.0.1",
     [string]$ISCC = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 )
 

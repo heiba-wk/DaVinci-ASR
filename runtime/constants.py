@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-RUNTIME_VERSION = "1.0.0"
+RUNTIME_VERSION = "1.0.1"
 PROTOCOL_VERSION = 1
 SELF_TEST_REVISION = 3
 SAMPLE_RATE = 16_000
