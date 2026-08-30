@@ -44,7 +44,7 @@ mkdir -p \
 
 cp "$PROJECT_ROOT/DaVinci ASR/DaVinci ASR.lua" "$STAGE_DIR/DaVinci ASR/DaVinci ASR.lua"
 cp "$PROJECT_ROOT/DaVinci ASR/config/setting.json" "$STAGE_DIR/DaVinci ASR/config/setting.json"
-cp "$PROJECT_ROOT/DaVinci ASR/render_preset/render_to_asr_wav.xml" "$STAGE_DIR/DaVinci ASR/render_preset/render_to_asr_wav.xml"
+cp "$PROJECT_ROOT/DaVinci ASR/render_preset/render_to_wav.xml" "$STAGE_DIR/DaVinci ASR/render_preset/render_to_wav.xml"
 cp "$PROJECT_ROOT/LICENSE" "$STAGE_DIR/LICENSE"
 cp "$PROJECT_ROOT/THIRD_PARTY_NOTICES.md" "$STAGE_DIR/THIRD_PARTY_NOTICES.md"
 cp "$SCRIPT_DIR/DaVinciASR.iss" "$STAGE_DIR/DaVinciASR.iss"

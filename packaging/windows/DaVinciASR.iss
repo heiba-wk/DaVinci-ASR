@@ -41,7 +41,7 @@ UninstallDisplayName={#AppName}
 [Files]
 Source: "{#SourceRoot}\DaVinci ASR\DaVinci ASR.lua"; DestDir: "{#ResolveScriptRoot}"; Flags: ignoreversion
 Source: "{#SourceRoot}\DaVinci ASR\config\setting.json"; DestDir: "{#ResolveScriptRoot}\config"; Flags: onlyifdoesntexist
-Source: "{#SourceRoot}\DaVinci ASR\render_preset\render_to_asr_wav.xml"; DestDir: "{#ResolveScriptRoot}\render_preset"; Flags: ignoreversion
+Source: "{#SourceRoot}\DaVinci ASR\render_preset\render_to_wav.xml"; DestDir: "{#ResolveScriptRoot}\render_preset"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{#RuntimeRoot}"; Flags: ignoreversion
 Source: "{#SourceRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{#RuntimeRoot}"; Flags: ignoreversion
 Source: "{#RuntimeBuildRoot}\windows-cuda-x64\dist\DaVinci ASR\*"; DestDir: "{#RuntimeRoot}"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: HasNvidiaGPU

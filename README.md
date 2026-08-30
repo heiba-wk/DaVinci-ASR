@@ -75,8 +75,10 @@ Do not move the source folder after this step. Completely quit and reopen DaVinc
 
 1. Open a Resolve project and timeline containing audio, then open `DaVinci ASR`.
 2. The first time, click `Download Models`, choose `ModelScope` or `Hugging Face`, and wait until the models are ready. ModelScope is recommended in mainland China.
-3. Select a language and click `Create Subtitles`. You can optionally enter names or terms in the phrases/prompt field.
-4. The generated subtitles are imported into the current Resolve project.
+3. For automatic subtitles, select a language and optionally enter names or terms in `Phrases / Prompt`. To use Script Match, check `Script Match`; the main window is hidden while a separate script window is open.
+4. Paste the complete, line-broken script and click `Use Script`, or close the script window. Every non-empty input line becomes exactly one final subtitle block. Script Match is enabled only when the text is non-empty; closing an empty window automatically clears the checkbox. Selecting Chinese or English enables direct Forced Aligner timing without ASR when the quality gate passes.
+5. Click `Create Subtitles`. Script Match preserves each matched line before optional subtitle post-processing. `Max Characters` is disabled and ignored because the supplied line breaks define the blocks; `No Gaps` and `No End Marks` remain available and are applied after the matched SRT blocks are built. The script is session-only and is cleared when the utility is reopened.
+6. The generated subtitles are imported into the current Resolve project.
 
 The models only need to be downloaded once. Later uses reuse the local files.
 

@@ -152,7 +152,7 @@ mkdir -p \
 ditto "$RUNTIME_APP" "$RUNTIME_DEST/DaVinci ASR.app"
 cp "$LUA_SOURCE" "$SCRIPT_DEST/DaVinci ASR.lua"
 cp "$PROJECT_ROOT/DaVinci ASR/config/setting.json" "$SCRIPT_DEST/config/setting.json"
-cp "$PROJECT_ROOT/DaVinci ASR/render_preset/render_to_asr_wav.xml" "$SCRIPT_DEST/render_preset/render_to_asr_wav.xml"
+cp "$PROJECT_ROOT/DaVinci ASR/render_preset/render_to_wav.xml" "$SCRIPT_DEST/render_preset/render_to_wav.xml"
 "$BUILD_PYTHON" -c 'import re, sys; source = open(sys.argv[1], encoding="utf-8").read(); match = re.search(r"Config\.DEFAULTS\s*=\s*\{(.*?)\n\s*\}", source, re.S); assert match and re.search(r"\bmax_chars\s*=\s*42\b", match.group(1)), "Packaged default max_chars must be 42"; assert match and re.search(r"\bui_language\s*=\s*\"en\"", match.group(1)), "Packaged default ui_language must be en"' "$SCRIPT_DEST/DaVinci ASR.lua"
 mkdir -p "$PKG_SCRIPTS"
 cp "$SCRIPT_DIR/pkg-scripts/preinstall" "$PKG_SCRIPTS/preinstall"

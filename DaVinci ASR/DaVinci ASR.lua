@@ -45,6 +45,7 @@ do
     Config.UPDATE_TIMEOUT = 5
     Config.ERROR_LOG_THROTTLE_SECONDS = 30
     Config.WINDOW_ID = "DaVinciASRWindow"
+    Config.SCRIPT_MATCH_WINDOW_ID = "DaVinciASRScriptMatch"
     Config.PROTOCOL_VERSION = 1
     Config.SEPARATOR = separator
     Config.IS_WINDOWS = separator == "\\"
@@ -52,8 +53,8 @@ do
     Config.PROJECT_ROOT = parent(Config.SCRIPT_DIR)
     Config.INSTALL_CONFIG_DIR = join(Config.SCRIPT_DIR, "config")
     Config.INSTALL_SETTINGS_FILE = join(Config.INSTALL_CONFIG_DIR, "setting.json")
-    Config.RENDER_PRESET_NAME = "render_to_asr_wav"
-    Config.RENDER_PRESET_FILE = join(join(Config.SCRIPT_DIR, "render_preset"), "render_to_asr_wav.xml")
+    Config.RENDER_PRESET_NAME = "render_to_wav"
+    Config.RENDER_PRESET_FILE = join(join(Config.SCRIPT_DIR, "render_preset"), "render_to_wav.xml")
     Config.AUDIO_TEMP_DIR = join(Config.SCRIPT_DIR, "audio_temp")
     Config.MODELS_DIR = join(Config.SCRIPT_DIR, "models")
 
@@ -151,8 +152,10 @@ do
     }
     Config.DEFAULTS = {
         asr_model = "asr",
+        mode = "auto_subtitle",
         language = "Auto",
         prompt = "",
+        reference_text = "",
         max_chars = 42,
         remove_gaps = false,
         trim_end_punctuation = false,
@@ -1001,7 +1004,7 @@ do
         local stored, loadError = Utils.readJson(Config.SETTINGS_FILE)
         if type(stored) == "table" then
             for key, defaultValue in pairs(Config.DEFAULTS) do
-                if type(stored[key]) == type(defaultValue) then
+                if key ~= "reference_text" and type(stored[key]) == type(defaultValue) then
                     values[key] = stored[key]
                 end
             end
@@ -1015,6 +1018,7 @@ do
         local source = values or Config.DEFAULTS
         local payload = {
             asr_model = tostring(source.asr_model or "asr"),
+            mode = source.mode == "script_match" and "script_match" or "auto_subtitle",
             language = tostring(source.language or "Auto"),
             prompt = tostring(source.prompt or ""),
             max_chars = tonumber(source.max_chars) or 42,
@@ -1310,7 +1314,7 @@ do
             return nil, "Resolve is already rendering. Wait for the current render to finish."
         end
         if not Utils.fileExists(Config.RENDER_PRESET_FILE) then
-            return nil, "Bundled render_to_asr_wav.xml is missing."
+            return nil, "Bundled render_to_wav.xml is missing."
         end
         local targetDirectory = Config.AUDIO_TEMP_DIR
         Utils.ensureDir(targetDirectory)
@@ -1328,7 +1332,7 @@ do
         if context.project:LoadRenderPreset(Config.RENDER_PRESET_NAME) ~= true then
             restorePreviousSelection()
             self:returnToEditPage()
-            return nil, "Resolve could not load the bundled render_to_asr_wav preset."
+            return nil, "Resolve could not load the bundled render_to_wav preset."
         end
         local settings = {
             SelectAllFrames = cacheState.selectAllFrames ~= false,
@@ -1593,10 +1597,15 @@ do
         suppressEditor = false,
         tick = 0,
         currentLanguage = "en",
+        scriptMatchWindow = nil,
+        scriptMatchItems = nil,
         downloadSourceWindow = nil,
         downloadSourceItems = nil,
         diagnosticsWindow = nil,
         diagnosticsItems = nil,
+        _referenceText = "",
+        _scriptMatchPreviousText = "",
+        _scriptMatchWindowOpen = false,
         _statusKey = "ready_help",
         _statusArgs = {},
         _lastDownloadStatus = nil,
@@ -1638,6 +1647,14 @@ do
             cn = "就绪：选语言后创建字幕。",
             en = "Ready: choose a language, then create subtitles."
         },
+        reference_required = {
+            cn = "文稿匹配需要至少一行非空文稿。",
+            en = "Script Match requires at least one non-empty script line."
+        },
+        script_match_ready = {
+            cn = "文稿匹配已启用：每个非空行将生成一个字幕块。",
+            en = "Script Match enabled: each non-empty line becomes one subtitle block."
+        },
         enter_find_text = { cn = "请输入查找文字。", en = "Enter text to find." },
         matches_rows_occ = { cn = "%d 条字幕，%d 处匹配。", en = "%d rows, %d matches." },
         no_find_results = { cn = "未找到匹配字幕。", en = "No matches found." },
@@ -1663,7 +1680,10 @@ do
         model_download_failed = { cn = "下载失败，请检查网络。", en = "Download failed. Check your network." },
         model_required = { cn = "请先下载模型。", en = "Download the model first." },
         timeline_prepare_failed = { cn = "无法读取当前时间线。", en = "Could not read the current timeline." },
-        render_start_failed = { cn = "无法导出时间线音频。", en = "Could not export timeline audio." },
+        render_start_failed = {
+            cn = "无法导出时间线音频：%s",
+            en = "Could not export timeline audio: %s"
+        },
         subtitle_progress = { cn = "正在创建字幕 %d%%…", en = "Creating subtitles %d%%…" },
         no_task = { cn = "当前没有任务。", en = "No task is running." },
         render_cancelled = { cn = "音频导出已取消。", en = "Audio export cancelled." },
@@ -1678,7 +1698,7 @@ do
         result_unreadable = { cn = "结果无法读取，请打开诊断。", en = "Could not read the result. Open diagnostics." },
         task_cancelled = { cn = "任务已取消。", en = "Task cancelled." },
         runtime_error = { cn = "任务失败，请打开诊断。", en = "Task failed. Open diagnostics." },
-        render_failed = { cn = "音频导出失败。", en = "Audio export failed." },
+        render_failed = { cn = "音频导出失败：%s", en = "Audio export failed: %s" },
         edited_srt_write_failed = { cn = "编辑字幕保存失败。", en = "Could not save edited subtitles." },
         edited_subtitles_imported = { cn = "编辑字幕已导入。", en = "Edited subtitles imported." },
         edited_subtitles_import_failed = { cn = "编辑字幕导入失败。", en = "Edited subtitle import failed." },
@@ -1695,6 +1715,14 @@ do
             RemoveGaps = "字幕无间隙",
             TrimPunctuation = "句末无标点",
             PromptLabel = "短语列表 / 提示",
+            ScriptMatchCheckBox = "文稿匹配",
+            ScriptMatchCheckBoxTip = "勾选后，在独立窗口粘贴并确认按阅读逻辑分行的文稿。",
+            ScriptMatchWindowTitle = "文稿匹配",
+            ScriptMatchInfo = "请粘贴完整文稿，并按照最终字幕的阅读逻辑预先分行。",
+            ScriptMatchInstructions = "• 每个非空行会原样生成一个字幕块；空行会被忽略。\n• 请在自然停顿、从句或完整短语处换行，避免拆开数字与单位、人名或成对引号。\n• 建议单行不超过 42 个显示单位，并保留原有大小写、数字和标点。\n• 主窗口中的“字幕无间隙”和“句末无标点”会在匹配完成后应用。",
+            ScriptMatchPlaceholder = "在此粘贴已经分行的完整文稿…",
+            ScriptMatchUse = "使用文稿",
+            ScriptMatchCancel = "取消",
             DownloadModels = "模型下载",
             DownloadSourceWindowTitle = "选择模型下载源",
             DownloadSourceMessage = "中国用户建议选择 ModelScope，非中国用户建议选择 Hugging Face。请选择下载来源。",
@@ -1754,6 +1782,14 @@ do
             RemoveGaps = "No Gaps",
             TrimPunctuation = "No End Marks",
             PromptLabel = "Phrases / Prompt",
+            ScriptMatchCheckBox = "Script Match",
+            ScriptMatchCheckBoxTip = "Open a separate window to paste and confirm a script split for natural reading.",
+            ScriptMatchWindowTitle = "Script Match",
+            ScriptMatchInfo = "Paste the complete script and split it into the final subtitle reading units.",
+            ScriptMatchInstructions = "• Each non-empty line becomes one subtitle block verbatim; empty lines are ignored.\n• Break at natural pauses, clauses, or complete phrases; keep numbers with units, names, and paired quotes together.\n• Keep each line within 42 display units and preserve the original case, numbers, and punctuation.\n• “No Gaps” and “No End Marks” from the main window are applied after matching.",
+            ScriptMatchPlaceholder = "Paste the complete line-broken script here…",
+            ScriptMatchUse = "Use Script",
+            ScriptMatchCancel = "Cancel",
             DownloadModels = "Download Models",
             DownloadSourceWindowTitle = "Choose Model Download Source",
             DownloadSourceMessage = "ModelScope is recommended in China; Hugging Face is recommended outside China. Choose a download source.",
@@ -1811,7 +1847,7 @@ do
         return Core.dispatcher:AddWindow({
             ID = Config.WINDOW_ID,
             WindowTitle = Config.SCRIPT_NAME .. " " .. Config.SCRIPT_VERSION,
-            Geometry = { 460, 240, 800, 500 },
+            Geometry = { 430, 190, 880, 620 },
             Spacing = 10,
             StyleSheet = "*{font-size:14px;}"
         }, ui:VGroup{
@@ -1840,6 +1876,17 @@ do
                         }
                     },
                     ui:Button{ ID = "DownloadModels", Text = "模型下载", Weight = 0 },
+                    ui:HGroup{
+                        Weight = 0,
+                        ui:CheckBox{
+                            ID = "ScriptMatchCheckBox",
+                            Text = "文稿匹配",
+                            ToolTip = "勾选后，在独立窗口粘贴并确认按阅读逻辑分行的文稿。",
+                            Checked = false,
+                            Weight = 0
+                        },
+                        ui:Label{ Text = "", Weight = 1 }
+                    },
                     ui:HGroup{
                         Weight = 0,
                         ui:Label{ ID = "LangLabel", Text = "语言", Weight = 0.4 },
@@ -2108,12 +2155,183 @@ do
         UI.items.LanguageCombo.CurrentIndex = math.max(0, math.min(#Config.LANGUAGES - 1, selected))
     end
 
+    function UI.hasReferenceText(value)
+        return tostring(value or ""):find("%S") ~= nil
+    end
+
+    function UI.referenceText()
+        return tostring(UI._referenceText or "")
+    end
+
+    function UI.selectedMode()
+        local checked = UI.items
+            and UI.items.ScriptMatchCheckBox
+            and UI.items.ScriptMatchCheckBox.Checked == true
+        if checked and UI.hasReferenceText(UI.referenceText()) then
+            return "script_match"
+        end
+        return "auto_subtitle"
+    end
+
+    function UI.updateModeControls()
+        if not UI.items then
+            return
+        end
+        local scriptMatch = UI.selectedMode() == "script_match"
+        for _, id in ipairs({ "PromptLabel", "PromptEdit" }) do
+            if UI.items[id] then
+                UI.items[id].Enabled = not scriptMatch
+            end
+        end
+        for _, id in ipairs({ "MaxCharsLabel", "MaxChars" }) do
+            if UI.items[id] then
+                UI.items[id].Enabled = not scriptMatch
+            end
+        end
+    end
+
+    function UI.refreshScriptMatchWindowLanguage()
+        if not UI.scriptMatchWindow or not UI.scriptMatchItems then
+            return
+        end
+        UI.scriptMatchWindow.WindowTitle = UI.text("ScriptMatchWindowTitle")
+        UI.scriptMatchItems.ScriptMatchInfo.Text = UI.text("ScriptMatchInfo")
+        UI.scriptMatchItems.ScriptMatchInstructions.Text = UI.text("ScriptMatchInstructions")
+        UI.scriptMatchItems.ScriptMatchTextEdit.PlaceholderText = UI.text("ScriptMatchPlaceholder")
+        UI.scriptMatchItems.ScriptMatchUse.Text = UI.text("ScriptMatchUse")
+        UI.scriptMatchItems.ScriptMatchCancel.Text = UI.text("ScriptMatchCancel")
+    end
+
+    function UI.ensureScriptMatchWindow()
+        if UI.scriptMatchWindow then
+            return true
+        end
+        local ui = Core.ui
+        local dialog = Core.dispatcher:AddWindow({
+            ID = Config.SCRIPT_MATCH_WINDOW_ID,
+            WindowTitle = UI.text("ScriptMatchWindowTitle"),
+            Geometry = { 430, 190, 880, 620 },
+            Spacing = 10,
+            StyleSheet = "*{font-size:14px;}"
+        }, ui:VGroup{
+            Spacing = 10,
+            ui:Label{
+                ID = "ScriptMatchInfo",
+                Text = UI.text("ScriptMatchInfo"),
+                Alignment = { AlignHCenter = true, AlignVCenter = true },
+                WordWrap = true,
+                Weight = 0
+            },
+            ui:HGroup{
+                Spacing = 12,
+                Weight = 1,
+                ui:VGroup{
+                    Weight = 65,
+                    ui:TextEdit{
+                        ID = "ScriptMatchTextEdit",
+                        PlainText = UI.referenceText(),
+                        PlaceholderText = UI.text("ScriptMatchPlaceholder"),
+                        StyleSheet = "*{font-size:16px;}",
+                        Weight = 1
+                    }
+                },
+                ui:VGroup{
+                    Weight = 35,
+                    ui:Label{
+                        ID = "ScriptMatchInstructions",
+                        Text = UI.text("ScriptMatchInstructions"),
+                        WordWrap = true,
+                        Alignment = { AlignLeft = true, AlignTop = true },
+                        Weight = 0
+                    },
+                    ui:Label{ Text = "", Weight = 1 }
+                }
+            },
+            ui:HGroup{
+                Weight = 0,
+                ui:Label{ Text = "", Weight = 1 },
+                ui:Button{ ID = "ScriptMatchCancel", Text = UI.text("ScriptMatchCancel"), Weight = 0 },
+                ui:Button{ ID = "ScriptMatchUse", Text = UI.text("ScriptMatchUse"), Weight = 0 }
+            }
+        })
+        UI.scriptMatchWindow = dialog
+        UI.scriptMatchItems = dialog:GetItems()
+        dialog.On.ScriptMatchUse.Clicked = UI.guard("SCRIPT_MATCH_CONFIRM_FAILED", function()
+            UI.closeScriptMatchWindow(true)
+        end)
+        dialog.On.ScriptMatchCancel.Clicked = UI.guard("SCRIPT_MATCH_CANCEL_FAILED", function()
+            UI.closeScriptMatchWindow(false)
+        end)
+        dialog.On[Config.SCRIPT_MATCH_WINDOW_ID].Close = UI.guard("SCRIPT_MATCH_CLOSE_FAILED", function()
+            UI.closeScriptMatchWindow(true)
+        end)
+        UI.refreshScriptMatchWindowLanguage()
+        return true
+    end
+
+    function UI.showScriptMatchWindow()
+        UI.ensureScriptMatchWindow()
+        UI._scriptMatchPreviousText = UI.referenceText()
+        UI.scriptMatchItems.ScriptMatchTextEdit.PlainText = UI.referenceText()
+        UI.refreshScriptMatchWindowLanguage()
+        UI.scriptMatchWindow:Show()
+        if UI.window then
+            UI.window:Hide()
+        end
+        UI._scriptMatchWindowOpen = true
+        pcall(function()
+            UI.scriptMatchItems.ScriptMatchTextEdit:SetFocus("OtherFocusReason")
+        end)
+        return true
+    end
+
+    function UI.closeScriptMatchWindow(acceptDraft)
+        if acceptDraft and UI.scriptMatchItems and UI.scriptMatchItems.ScriptMatchTextEdit then
+            local editor = UI.scriptMatchItems.ScriptMatchTextEdit
+            UI._referenceText = tostring(editor.PlainText or "")
+        elseif not acceptDraft then
+            UI._referenceText = tostring(UI._scriptMatchPreviousText or UI._referenceText or "")
+        end
+        UI._scriptMatchPreviousText = ""
+        local enabled = acceptDraft and UI.hasReferenceText(UI._referenceText)
+        if acceptDraft and not enabled then
+            UI._referenceText = ""
+        end
+        if UI.items and UI.items.ScriptMatchCheckBox then
+            UI.items.ScriptMatchCheckBox.Checked = enabled
+        end
+        if UI.scriptMatchWindow then
+            UI.scriptMatchWindow:Hide()
+        end
+        UI._scriptMatchWindowOpen = false
+        if UI.window then
+            UI.window:Show()
+        end
+        UI.updateModeControls()
+        App.Settings:save(UI.collectSettings())
+        UI.setStatusKey(enabled and "script_match_ready" or "ready_help")
+        return enabled
+    end
+
+    function UI.onScriptMatchCheckboxClicked()
+        local checked = UI.items
+            and UI.items.ScriptMatchCheckBox
+            and UI.items.ScriptMatchCheckBox.Checked == true
+        if checked then
+            return UI.showScriptMatchWindow()
+        end
+        UI.updateModeControls()
+        App.Settings:save(UI.collectSettings())
+        UI.setStatusKey("ready_help")
+        return false
+    end
+
     function UI.applyLanguage(language)
         UI.currentLanguage = language == "en" and "en" or "cn"
         local textIds = {
             "TitleLabel", "TreeTitleLabel", "ModelLabel",
             "LangLabel", "MaxCharsLabel", "RemoveGaps",
-            "TrimPunctuation", "PromptLabel", "DownloadModels",
+            "TrimPunctuation", "PromptLabel", "ScriptMatchCheckBox", "DownloadModels",
             "CreateSubtitles", "Cancel", "UpdateSubtitles", "FindButton",
             "SingleReplaceButton", "AllReplaceButton", "CopyrightButton"
         }
@@ -2125,13 +2343,16 @@ do
         UI.items.FindInput.PlaceholderText = UI.text("FindPlaceholder")
         UI.items.ReplaceInput.PlaceholderText = UI.text("ReplacePlaceholder")
         UI.items.PromptEdit.PlaceholderText = UI.text("PromptPlaceholder")
+        UI.items.ScriptMatchCheckBox.ToolTip = UI.text("ScriptMatchCheckBoxTip")
         UI.items.LangEnCheckBox.Checked = UI.currentLanguage == "en"
         UI.items.LangCnCheckBox.Checked = UI.currentLanguage == "cn"
         UI.populateLanguageCombo()
+        UI.updateModeControls()
         UI.refreshRuntimeStatus()
         if Core.job and Core.job.action == "download_models" and UI._lastDownloadStatus then
             UI.items.DownloadModels.Text = UI.downloadButtonText(UI._lastDownloadStatus)
         end
+        UI.refreshScriptMatchWindowLanguage()
         UI.refreshDownloadSourceWindowLanguage()
         UI.refreshDiagnosticsWindowLanguage()
         UI.renderStatus()
@@ -2246,10 +2467,13 @@ do
 
     function UI.collectSettings()
         local languageIndex = tonumber(UI.items.LanguageCombo.CurrentIndex or 0) or 0
+        local mode = UI.selectedMode()
         return {
             asr_model = UI.selectedASRModel().key,
+            mode = mode,
             language = Config.LANGUAGES[languageIndex + 1] or "Auto",
             prompt = UI.items.PromptEdit.PlainText or "",
+            reference_text = mode == "script_match" and UI.referenceText() or "",
             max_chars = tonumber(UI.items.MaxChars.Value) or 42,
             remove_gaps = UI.items.RemoveGaps.Checked == true,
             trim_end_punctuation = UI.items.TrimPunctuation.Checked == true,
@@ -2275,10 +2499,14 @@ do
         UI.items.ModelCombo.CurrentIndex = modelIndex
         UI.items.LanguageCombo.CurrentIndex = index
         UI.items.PromptEdit.PlainText = values.prompt or ""
+        UI._referenceText = tostring(values.reference_text or "")
+        UI.items.ScriptMatchCheckBox.Checked = values.mode == "script_match"
+            and UI.hasReferenceText(UI._referenceText)
         UI.items.MaxChars.Value = tonumber(values.max_chars) or 42
         UI.items.RemoveGaps.Checked = values.remove_gaps == true
         UI.items.TrimPunctuation.Checked = values.trim_end_punctuation == true
         UI.applyLanguage(values.ui_language)
+        UI.updateModeControls()
     end
 
     function UI.selectedASRModel()
@@ -2427,10 +2655,12 @@ do
             protocol = Config.PROTOCOL_VERSION,
             job_id = jobId,
             action = "download_models",
+            mode = "auto_subtitle",
             asr_model = selectedModel.key,
             audio_path = "",
             language = "Auto",
             prompt = "",
+            reference_text = "",
             ui_language = UI.currentLanguage,
             download_source = source,
             subtitle = {
@@ -2517,6 +2747,11 @@ do
     function UI.startCreateSubtitles()
         local settings = UI.collectSettings()
         App.Settings:save(settings)
+        if settings.mode == "script_match"
+            and not tostring(settings.reference_text or ""):find("%S") then
+            UI.setStatusKey("reference_required")
+            return
+        end
         if not UI.ensureRuntime() then
             return
         end
@@ -2584,10 +2819,12 @@ do
             protocol = Config.PROTOCOL_VERSION,
             job_id = job.id,
             action = "transcribe",
+            mode = job.settings.mode,
             asr_model = job.settings.asr_model,
             audio_path = audioPath,
             language = job.settings.language,
             prompt = job.settings.prompt,
+            reference_text = job.settings.reference_text,
             ui_language = UI.currentLanguage,
             subtitle = {
                 max_chars = job.settings.max_chars,
@@ -3628,6 +3865,11 @@ do
                     UI.downloadSourceWindow:Hide()
                 end)
             end
+            if UI.scriptMatchWindow then
+                pcall(function()
+                    UI.scriptMatchWindow:Hide()
+                end)
+            end
             if UI.diagnosticsWindow then
                 pcall(function()
                     UI.diagnosticsWindow:Hide()
@@ -3647,6 +3889,13 @@ do
             else
                 UI.setStatusKey("model_required")
             end
+        end)
+        window.On.ScriptMatchCheckBox.Clicked = UI.guard(
+            "SCRIPT_MATCH_CHECKBOX_FAILED",
+            UI.onScriptMatchCheckboxClicked
+        )
+        window.On.LanguageCombo.CurrentIndexChanged = UI.guard("LANGUAGE_CHANGE_FAILED", function()
+            App.Settings:save(UI.collectSettings())
         end)
         window.On.Cancel.Clicked = UI.guard("CANCEL_CLICK_FAILED", UI.cancelCurrentJob)
         window.On.SubtitleTree.ItemClicked = UI.guard("TREE_CLICK_FAILED", UI.selectTreeItem)

@@ -39,6 +39,10 @@ ASR_1_7B_MODEL_KEY = "asr_1_7b"
 ASR_MODEL_KEYS: tuple[str, ...] = (ASR_MODEL_KEY, ASR_1_7B_MODEL_KEY)
 ALIGNER_MODEL_KEY = "forced_aligner"
 
+AUTO_SUBTITLE_MODE = "auto_subtitle"
+SCRIPT_MATCH_MODE = "script_match"
+TRANSCRIPTION_MODES: tuple[str, ...] = (AUTO_SUBTITLE_MODE, SCRIPT_MATCH_MODE)
+
 ALIGNMENT_LANGUAGES: tuple[str, ...] = (
     "Chinese",
     "English",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -13,11 +14,13 @@ from runtime.audio.chunker import InferenceWindow, plan_windows
 from runtime.audio.store import AudioStore, prepare_audio_store
 from runtime.audio.vad import SileroVAD, SpeechRegion
 from runtime.constants import (
+    AUTO_SUBTITLE_MODE,
     ALIGNMENT_LANGUAGES,
     ASR_WINDOW_MAX_NEW_TOKENS,
     PROTOCOL_VERSION,
     RECOVERY_CONTEXT_SECONDS,
     RECOVERY_CORE_MAX_SECONDS,
+    SCRIPT_MATCH_MODE,
     UNSUPPORTED_ALIGNMENT_ERROR,
     VAD_MIN_SPEECH_MS,
     WINDOW_CONTEXT_SECONDS,
@@ -33,7 +36,9 @@ from runtime.core.types import (
     JobRequest,
     JobResult,
     SubtitleBlock,
+    SubtitleOptions,
     TimedToken,
+    TimelineSpec,
 )
 from runtime.inference.aligner import AlignmentResult, QwenForcedAlignerEngine
 from runtime.inference.asr import QwenASREngine
@@ -53,9 +58,25 @@ from runtime.inference.service import InferenceService
 from runtime.ipc.atomic import atomic_write_json_fast
 from runtime.subtitles.punctuation import restore_punctuation
 from runtime.subtitles.quantize import quantize_blocks
+from runtime.subtitles.script_match import (
+    DIRECT_MAX_AUDIO_SECONDS,
+    DIRECT_MIN_LINE_COVERAGE,
+    FALLBACK_MIN_ALIGNMENT_COVERAGE,
+    FALLBACK_MIN_GLOBAL_ANCHOR_COVERAGE,
+    FALLBACK_MIN_MAPPING_COVERAGE,
+    ScriptLine,
+    ScriptMapping,
+    build_anchor_plan,
+    evaluate_direct_quality,
+    interval_diagnostics,
+    map_aligned_tokens_to_lines,
+    parse_reference_lines,
+    reference_alignment_text,
+)
 from runtime.subtitles.segmenter import (
     effective_max_chars,
     join_token_text,
+    postprocess_subtitle_blocks,
     segment_tokens,
 )
 from runtime.subtitles.srt import write_srt
@@ -184,9 +205,7 @@ class WindowRecord:
         value["core_claimed"] = self.core_claimed
         if self.alignment is not None:
             value["alignment_valid"] = self.alignment.valid
-            value["alignment_text_coverage"] = round(
-                self.alignment.text_coverage, 4
-            )
+            value["alignment_text_coverage"] = round(self.alignment.text_coverage, 4)
             value["alignment_error"] = self.alignment.error
         if self.self_repair_backend:
             value["self_repair_backend"] = self.self_repair_backend
@@ -205,6 +224,16 @@ class PipelineStats:
     recovery_success_count: int = 0
     cpu_self_repair_attempt_count: int = 0
     cpu_self_repair_success_count: int = 0
+
+
+def _accumulate_metric_ms(
+    metrics: PerformanceMetrics, key: str, milliseconds: object
+) -> None:
+    try:
+        value = max(0.0, float(milliseconds))
+    except (TypeError, ValueError):
+        return
+    metrics.values[key] = round(float(metrics.values.get(key, 0.0)) + value, 3)
 
 
 class _ASRProtocolError(RuntimeError):
@@ -229,10 +258,16 @@ def _is_abnormal_text(text: str) -> bool:
         return True
     if len(value) >= 128:
         characters = [character for character in value if not character.isspace()]
-        if characters and Counter(characters).most_common(1)[0][1] / len(characters) >= 0.90:
+        if (
+            characters
+            and Counter(characters).most_common(1)[0][1] / len(characters) >= 0.90
+        ):
             return True
         words = value.casefold().split()
-        if len(words) >= 16 and Counter(words).most_common(1)[0][1] / len(words) >= 0.80:
+        if (
+            len(words) >= 16
+            and Counter(words).most_common(1)[0][1] / len(words) >= 0.80
+        ):
             return True
     return False
 
@@ -490,6 +525,7 @@ class TranscriptionPipeline:
             aligner_factory=aligner_factory,
         )
         self._asr_factory = asr_factory
+        self._aligner_factory = aligner_factory
         self.speech_detector = speech_detector or SileroVAD()
         self._owns_inference = inference_service is None
         self.log = logging.getLogger("davinci_asr.pipeline")
@@ -536,10 +572,540 @@ class TranscriptionPipeline:
                 region.to_dict(sample_rate) for region in recovery_regions
             ],
             "remaining_coverage_holes": [
-                region.to_dict(sample_rate)
-                for region in remaining_coverage_holes
+                region.to_dict(sample_rate) for region in remaining_coverage_holes
             ],
         }
+
+    def _detect_script_language(
+        self,
+        *,
+        request: JobRequest,
+        store: AudioStore,
+        metrics: PerformanceMetrics,
+        stats: PipelineStats,
+        update: StatusCallback,
+        cancelled: CancelCallback,
+    ) -> str:
+        update("preparing", 7, "Detecting speech for language identification")
+        vad_started = time.monotonic()
+        speech_regions = self.speech_detector.detect(store, is_cancelled=cancelled)
+        metrics.milliseconds("vad_ms", time.monotonic() - vad_started)
+        windows = plan_windows(
+            speech_regions=speech_regions,
+            total_samples=store.sample_count,
+            sample_rate=store.sample_rate,
+        )
+        metrics.values["script_language_detection_window_count"] = len(windows)
+        if not windows:
+            raise RuntimeError("No speech was detected")
+
+        update("loading_asr", 10, "Loading Qwen3 ASR for language detection")
+        asr, load_ms = self.inference.acquire_asr(request.asr_model)
+        _accumulate_metric_ms(metrics, "asr_model_load_ms", load_ms)
+        state = LanguageState("Auto")
+        errors: list[str] = []
+        try:
+            for index, window in enumerate(windows):
+                update(
+                    "transcribing",
+                    12 + int(8 * (index + 1) / len(windows)),
+                    f"Detecting language {index + 1}/{len(windows)}",
+                )
+                inference_started = time.monotonic()
+                try:
+                    result = transcribe_window(
+                        asr=asr,
+                        store=store,
+                        window=window,
+                        language_state=state,
+                        user_prompt="",
+                        previous_tail="",
+                        cancelled=cancelled,
+                    )
+                finally:
+                    stats.asr_inference_seconds += time.monotonic() - inference_started
+                _record_asr_result(stats, result)
+                if result.valid and state.trusted_language:
+                    metrics.values["script_language_detection_asr_calls"] = (
+                        stats.asr_attempt_count
+                    )
+                    return state.trusted_language
+                errors.append(result.error or "LANGUAGE_NOT_DETECTED")
+        finally:
+            self.inference.release_after_stage("asr")
+        raise RuntimeError("SCRIPT_MATCH_LANGUAGE_NOT_DETECTED:" + ",".join(errors))
+
+    def _script_match_fallback(
+        self,
+        *,
+        request: JobRequest,
+        language: str,
+        lines: list[ScriptLine],
+        store: AudioStore,
+        metrics: PerformanceMetrics,
+        stats: PipelineStats,
+        update: StatusCallback,
+        cancelled: CancelCallback,
+    ) -> tuple[list[SubtitleBlock], list[TimedToken], list[float], dict[str, object]]:
+        fallback_job_id = f"{request.job_id}_script_fallback"
+        fallback_dir = self.paths.temp / fallback_job_id
+        fallback_request = JobRequest(
+            protocol=PROTOCOL_VERSION,
+            job_id=fallback_job_id,
+            action="transcribe",
+            mode=AUTO_SUBTITLE_MODE,
+            audio_path=request.audio_path,
+            language=language,
+            prompt="",
+            reference_text="",
+            ui_language=request.ui_language,
+            asr_model=request.asr_model,
+            subtitle=SubtitleOptions(max_chars=42),
+            timeline=TimelineSpec(
+                fps=request.timeline.fps,
+                start_frame=request.timeline.start_frame,
+            ),
+        )
+        fallback_pipeline = TranscriptionPipeline(
+            self.paths,
+            self.hardware,
+            model_manager=self.models,
+            asr_factory=self._asr_factory,
+            aligner_factory=self._aligner_factory,
+            inference_service=self.inference,
+            speech_detector=self.speech_detector,
+        )
+        try:
+            update("loading_asr", 50, "Building ASR anchors for Script Match")
+            auto_result = fallback_pipeline.run(
+                fallback_request,
+                status=lambda state, progress, message: update(
+                    state,
+                    50 + int(max(0, min(100, progress)) * 0.25),
+                    f"Script Match fallback: {message}",
+                ),
+                is_cancelled=cancelled,
+            )
+            auto_metrics = auto_result.metrics
+            stats.asr_inference_seconds += (
+                float(auto_metrics.get("asr_inference_ms", 0.0)) / 1000.0
+            )
+            stats.aligner_inference_seconds += (
+                float(auto_metrics.get("aligner_inference_ms", 0.0)) / 1000.0
+            )
+            stats.asr_attempt_count += int(auto_metrics.get("asr_attempt_count", 0))
+            for source_key in (
+                "asr_model_load_ms",
+                "recovery_asr_model_load_ms",
+                "cpu_self_repair_asr_load_ms",
+            ):
+                _accumulate_metric_ms(
+                    metrics, "asr_model_load_ms", auto_metrics.get(source_key, 0.0)
+                )
+            for source_key in (
+                "aligner_model_load_ms",
+                "recovery_aligner_model_load_ms",
+            ):
+                _accumulate_metric_ms(
+                    metrics,
+                    "aligner_model_load_ms",
+                    auto_metrics.get(source_key, 0.0),
+                )
+            metrics.values["fallback_auto_subtitle_count"] = len(auto_result.blocks)
+            metrics.values["fallback_auto_rtf"] = auto_metrics.get("rtf")
+            metrics.values["fallback_auto_partial_result"] = bool(
+                auto_metrics.get("partial_result", False)
+            )
+
+            plan = build_anchor_plan(
+                lines,
+                auto_result.blocks,
+                language=language,
+                duration=store.duration_seconds,
+            )
+            if (
+                plan.unmapped_line_indices
+                or len(plan.windows) != len(lines)
+                or plan.mapping_coverage + 1e-9 < FALLBACK_MIN_GLOBAL_ANCHOR_COVERAGE
+            ):
+                raise RuntimeError(
+                    "SCRIPT_MATCH_FALLBACK_ANCHORS_UNRELIABLE "
+                    f"coverage={plan.mapping_coverage:.4f} "
+                    f"unmapped={plan.unmapped_line_indices}"
+                )
+
+            update(
+                "loading_aligner",
+                77,
+                "Loading Qwen3 Forced Aligner for Script Match fallback",
+            )
+            aligner, load_ms = self.inference.acquire_aligner()
+            _accumulate_metric_ms(metrics, "aligner_model_load_ms", load_ms)
+            blocks: list[SubtitleBlock] = []
+            tokens: list[TimedToken] = []
+            coverages: list[float] = []
+            try:
+                for index, window in enumerate(plan.windows):
+                    if cancelled():
+                        raise InterruptedError("Job cancelled")
+                    update(
+                        "aligning",
+                        79 + int(11 * (index + 1) / len(plan.windows)),
+                        f"Aligning script line {index + 1}/{len(plan.windows)}",
+                    )
+                    start_sample = max(0, int(round(window.start * store.sample_rate)))
+                    end_sample = min(
+                        store.sample_count,
+                        int(round(window.end * store.sample_rate)),
+                    )
+                    waveform = store.read(start_sample, end_sample)
+                    input_start = start_sample / float(store.sample_rate)
+                    input_end = end_sample / float(store.sample_rate)
+                    inference_started = time.monotonic()
+                    try:
+                        alignment = aligner.align_with_quality(
+                            waveform,
+                            window.line.text,
+                            language,
+                            offset_seconds=input_start,
+                            input_start_seconds=input_start,
+                            input_end_seconds=input_end,
+                            is_cancelled=cancelled,
+                        )
+                    finally:
+                        stats.aligner_inference_seconds += (
+                            time.monotonic() - inference_started
+                        )
+                    local_line = ScriptLine(
+                        index=0,
+                        line_id=window.line.line_id,
+                        source_line_number=window.line.source_line_number,
+                        text=window.line.text,
+                        normalized_text=window.line.normalized_text,
+                    )
+                    mapping = map_aligned_tokens_to_lines(
+                        alignment.tokens,
+                        [local_line],
+                        language=language,
+                        minimum_line_coverage=FALLBACK_MIN_MAPPING_COVERAGE,
+                    )
+                    if (
+                        not alignment.valid
+                        or alignment.text_coverage + 1e-9
+                        < FALLBACK_MIN_ALIGNMENT_COVERAGE
+                        or mapping.unmapped_line_indices
+                        or len(mapping.blocks) != 1
+                    ):
+                        raise RuntimeError(
+                            "SCRIPT_MATCH_FALLBACK_LINE_UNRELIABLE "
+                            f"line_id={window.line.line_id} "
+                            f"alignment_coverage={alignment.text_coverage:.4f} "
+                            f"mapping_coverage={mapping.mapping_coverage:.4f} "
+                            f"error={alignment.error}"
+                        )
+                    mapped = mapping.blocks[0]
+                    blocks.append(
+                        SubtitleBlock(mapped.start, mapped.end, window.line.text)
+                    )
+                    tokens.extend(alignment.tokens)
+                    coverages.append(alignment.text_coverage)
+            finally:
+                self.inference.release_after_stage("forced_aligner")
+
+            diagnostics = interval_diagnostics(blocks, store.duration_seconds)
+            if any(
+                (
+                    diagnostics.invalid_interval_count,
+                    diagnostics.non_monotonic_interval_count,
+                    diagnostics.overlap_count,
+                    diagnostics.out_of_bounds_count,
+                )
+            ):
+                raise RuntimeError(
+                    "SCRIPT_MATCH_FALLBACK_INTERVALS_INVALID "
+                    f"invalid={diagnostics.invalid_interval_count} "
+                    f"non_monotonic={diagnostics.non_monotonic_interval_count} "
+                    f"overlap={diagnostics.overlap_count} "
+                    f"out_of_bounds={diagnostics.out_of_bounds_count}"
+                )
+            return (
+                blocks,
+                tokens,
+                coverages,
+                {
+                    "fallback_anchor_mapping_coverage": round(plan.mapping_coverage, 6),
+                    "fallback_anchor_line_coverages": [
+                        round(value, 6) for value in plan.line_coverages
+                    ],
+                },
+            )
+        finally:
+            if fallback_dir.is_dir() and fallback_dir.parent == self.paths.temp:
+                shutil.rmtree(fallback_dir, ignore_errors=True)
+
+    @staticmethod
+    def _quantize_script_blocks(
+        blocks: list[SubtitleBlock],
+        *,
+        fps: str,
+        start_frame: int,
+        duration: float,
+    ) -> list[SubtitleBlock]:
+        output = quantize_blocks(
+            blocks,
+            fps,
+            start_frame=start_frame,
+            remove_gaps=False,
+        )
+        for block in output:
+            if block.end > duration:
+                block.end = duration
+            if block.end <= block.start:
+                raise RuntimeError("SCRIPT_MATCH_FRAME_QUANTIZATION_FAILED")
+        diagnostics = interval_diagnostics(output, duration)
+        if any(
+            (
+                diagnostics.invalid_interval_count,
+                diagnostics.non_monotonic_interval_count,
+                diagnostics.overlap_count,
+                diagnostics.out_of_bounds_count,
+            )
+        ):
+            raise RuntimeError("SCRIPT_MATCH_QUANTIZED_INTERVALS_INVALID")
+        return output
+
+    def _run_script_match(
+        self,
+        *,
+        request: JobRequest,
+        store: AudioStore,
+        cache_dir: Path,
+        started: float,
+        metrics: PerformanceMetrics,
+        stats: PipelineStats,
+        update: StatusCallback,
+        cancelled: CancelCallback,
+    ) -> JobResult:
+        lines = parse_reference_lines(request.reference_text)
+        reference_text = reference_alignment_text(lines)
+        duration = store.duration_seconds
+        metrics.values.update(
+            transcription_mode=SCRIPT_MATCH_MODE,
+            script_reference_line_count=len(lines),
+            script_reference_character_count=sum(
+                len(line.normalized_text) for line in lines
+            ),
+            script_max_chars_ignored=True,
+            script_remove_gaps_ignored=False,
+            script_trim_end_punctuation_ignored=False,
+            script_remove_gaps_applied=request.subtitle.remove_gaps,
+            script_trim_end_punctuation_applied=(
+                request.subtitle.trim_end_punctuation
+            ),
+            asr_model_load_ms=0.0,
+            aligner_model_load_ms=0.0,
+        )
+
+        language = request.language
+        if language == "Auto":
+            language = self._detect_script_language(
+                request=request,
+                store=store,
+                metrics=metrics,
+                stats=stats,
+                update=update,
+                cancelled=cancelled,
+            )
+
+        direct_attempted = duration <= DIRECT_MAX_AUDIO_SECONDS
+        direct_alignment = AlignmentResult(
+            [], 0.0, False, "AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT"
+        )
+        direct_mapping = ScriptMapping(
+            blocks=[],
+            mapping_coverage=0.0,
+            line_coverages=[0.0 for _line in lines],
+            unmapped_line_indices=[line.index for line in lines],
+            reference_character_count=sum(len(line.normalized_text) for line in lines),
+            matched_character_count=0,
+        )
+        direct_reasons: list[str] = []
+        direct_unique_ratio = 0.0
+        direct_span_ratio = 0.0
+        direct_locally_collapsed_lines: tuple[int, ...] = ()
+        direct_tokens: list[TimedToken] = []
+        if direct_attempted:
+            update("loading_aligner", 22, "Loading Qwen3 Forced Aligner")
+            aligner, load_ms = self.inference.acquire_aligner()
+            _accumulate_metric_ms(metrics, "aligner_model_load_ms", load_ms)
+            try:
+                update("aligning", 30, "Directly aligning the complete script")
+                waveform = store.read(0, store.sample_count)
+                inference_started = time.monotonic()
+                try:
+                    direct_alignment = aligner.align_with_quality(
+                        waveform,
+                        reference_text,
+                        language,
+                        offset_seconds=0.0,
+                        input_start_seconds=0.0,
+                        input_end_seconds=duration,
+                        is_cancelled=cancelled,
+                    )
+                finally:
+                    stats.aligner_inference_seconds += (
+                        time.monotonic() - inference_started
+                    )
+                direct_tokens = list(direct_alignment.tokens)
+                direct_mapping = map_aligned_tokens_to_lines(
+                    direct_tokens,
+                    lines,
+                    language=language,
+                    minimum_line_coverage=DIRECT_MIN_LINE_COVERAGE,
+                )
+                quality = evaluate_direct_quality(
+                    direct_alignment,
+                    direct_mapping,
+                    line_count=len(lines),
+                    duration=duration,
+                )
+                direct_reasons.extend(quality.reasons)
+                direct_unique_ratio = quality.unique_interval_ratio
+                direct_span_ratio = quality.aligned_span_ratio
+                direct_locally_collapsed_lines = (
+                    quality.locally_collapsed_line_indices
+                )
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                direct_reasons.append(f"DIRECT_EXCEPTION:{type(exc).__name__}")
+                self.log.warning(
+                    "job=%s script_match_direct_failed error_type=%s",
+                    request.job_id,
+                    type(exc).__name__,
+                )
+                self.inference.release_models()
+            finally:
+                self.inference.release_after_stage("forced_aligner")
+        else:
+            direct_reasons.append("AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT")
+
+        direct_success = direct_attempted and not direct_reasons
+        fallback_used = not direct_success
+        fallback_metrics: dict[str, object] = {}
+        if direct_success:
+            blocks = direct_mapping.blocks
+            tokens = direct_tokens
+            alignment_coverages = [direct_alignment.text_coverage]
+            path = "direct"
+        else:
+            update("preparing", 48, "Direct alignment needs ASR-anchor fallback")
+            blocks, tokens, alignment_coverages, fallback_metrics = (
+                self._script_match_fallback(
+                    request=request,
+                    language=language,
+                    lines=lines,
+                    store=store,
+                    metrics=metrics,
+                    stats=stats,
+                    update=update,
+                    cancelled=cancelled,
+                )
+            )
+            path = "asr_anchor_local_alignment"
+
+        update("segmenting", 91, "Preserving script line boundaries")
+        subtitle_started = time.monotonic()
+        blocks = self._quantize_script_blocks(
+            blocks,
+            fps=request.timeline.fps,
+            start_frame=request.timeline.start_frame,
+            duration=duration,
+        )
+        preservation_count = sum(
+            block.text == line.text for block, line in zip(blocks, lines)
+        )
+        if len(blocks) != len(lines) or preservation_count != len(lines):
+            raise RuntimeError("SCRIPT_MATCH_LINE_PRESERVATION_FAILED")
+        pre_postprocess_block_count = len(blocks)
+        blocks = postprocess_subtitle_blocks(
+            blocks,
+            remove_gaps=request.subtitle.remove_gaps,
+            trim_end_punctuation=request.subtitle.trim_end_punctuation,
+        )
+        diagnostics = interval_diagnostics(blocks, duration)
+        metrics.milliseconds("subtitle_build_ms", time.monotonic() - subtitle_started)
+        metrics.milliseconds("asr_inference_ms", stats.asr_inference_seconds)
+        metrics.milliseconds("aligner_inference_ms", stats.aligner_inference_seconds)
+        metrics.values.update(
+            script_line_mapping_unit=(
+                "characters" if language in {"Chinese", "Cantonese"} else "words"
+            ),
+            script_match_path=path,
+            script_direct_alignment_attempted=direct_attempted,
+            script_direct_alignment_success=direct_success,
+            script_direct_alignment_coverage=round(direct_alignment.text_coverage, 6),
+            script_direct_mapping_coverage=round(direct_mapping.mapping_coverage, 6),
+            script_direct_line_coverages=[
+                round(value, 6) for value in direct_mapping.line_coverages
+            ],
+            script_direct_unique_interval_ratio=round(direct_unique_ratio, 6),
+            script_direct_aligned_span_ratio=round(direct_span_ratio, 6),
+            script_direct_locally_collapsed_line_indices=[
+                index + 1 for index in direct_locally_collapsed_lines
+            ],
+            script_fallback_used=fallback_used,
+            script_fallback_trigger="|".join(dict.fromkeys(direct_reasons)),
+            script_output_line_count=len(blocks),
+            script_postprocess_removed_block_count=(
+                pre_postprocess_block_count - len(blocks)
+            ),
+            script_unmapped_line_count=0,
+            script_line_preservation_rate=round(preservation_count / len(lines), 6),
+            alignment_text_coverage=[round(value, 6) for value in alignment_coverages],
+            alignment_invalid_count=0,
+            invalid_interval_count=diagnostics.invalid_interval_count,
+            non_monotonic_interval_count=(diagnostics.non_monotonic_interval_count),
+            overlap_count=diagnostics.overlap_count,
+            out_of_bounds_count=diagnostics.out_of_bounds_count,
+            remaining_coverage_hole_count=0,
+            remaining_coverage_hole_seconds=0.0,
+            partial_result=False,
+            asr_attempt_count=stats.asr_attempt_count,
+            asr_skipped=stats.asr_attempt_count == 0,
+            direct_script_match_skipped_asr=(
+                direct_success
+                and request.language in {"Chinese", "English"}
+                and stats.asr_attempt_count == 0
+            ),
+            **fallback_metrics,
+        )
+
+        output = cache_dir / f"{request.job_id}.srt"
+        update("writing_srt", 95, "Writing UTF-8 SRT")
+        write_srt(output, blocks, preserve_text=True)
+        elapsed = time.monotonic() - started
+        metric_values = metrics.finish(
+            audio_duration=duration,
+            total_seconds=elapsed,
+        )
+        self.log.info(
+            "job=%s performance=%s",
+            request.job_id,
+            json.dumps(metric_values, sort_keys=True, separators=(",", ":")),
+        )
+        return JobResult(
+            protocol=PROTOCOL_VERSION,
+            job_id=request.job_id,
+            language=language,
+            transcript=reference_text,
+            alignment_count=len(tokens),
+            srt_path=str(output),
+            blocks=blocks,
+            backend=self.hardware.backend,
+            elapsed_seconds=elapsed,
+            metrics=metric_values,
+        )
 
     def run(
         self,
@@ -569,6 +1135,18 @@ class TranscriptionPipeline:
             metrics.values["backend"] = self.hardware.backend
             if cancelled():
                 raise InterruptedError("Job cancelled")
+
+            if request.mode == SCRIPT_MATCH_MODE:
+                return self._run_script_match(
+                    request=request,
+                    store=audio_store,
+                    cache_dir=cache_dir,
+                    started=started,
+                    metrics=metrics,
+                    stats=stats,
+                    update=update,
+                    cancelled=cancelled,
+                )
 
             update("preparing", 7, "Detecting speech")
             vad_started = time.monotonic()
@@ -662,7 +1240,9 @@ class TranscriptionPipeline:
             metrics.values["aligner_model_load_ms"] = round(aligner_load_ms, 3)
             initial_candidates: list[TokenCandidate] = []
             try:
-                alignable = [record for record in records if record.asr.valid and record.asr.text]
+                alignable = [
+                    record for record in records if record.asr.valid and record.asr.text
+                ]
                 for index, record in enumerate(alignable):
                     update(
                         "aligning",
@@ -708,11 +1288,7 @@ class TranscriptionPipeline:
 
             recovery_core_max_samples = max(
                 1,
-                int(
-                    round(
-                        RECOVERY_CORE_MAX_SECONDS * audio_store.sample_rate
-                    )
-                ),
+                int(round(RECOVERY_CORE_MAX_SECONDS * audio_store.sample_rate)),
             )
             auditable_speech_regions = split_speech_regions(
                 speech_regions,
@@ -744,9 +1320,7 @@ class TranscriptionPipeline:
             )
             metrics.values["recovery_region_count"] = len(recovery_regions)
             metrics.values["recovery_context_seconds"] = RECOVERY_CONTEXT_SECONDS
-            metrics.values["recovery_core_max_seconds"] = (
-                RECOVERY_CORE_MAX_SECONDS
-            )
+            metrics.values["recovery_core_max_seconds"] = RECOVERY_CORE_MAX_SECONDS
 
             recovered_candidates: list[TokenCandidate] = []
             recovery_records: list[WindowRecord] = []
@@ -877,12 +1451,7 @@ class TranscriptionPipeline:
                     for index, record in enumerate(alignable_recovery):
                         update(
                             "aligning",
-                            83
-                            + int(
-                                2
-                                * (index + 1)
-                                / max(1, len(alignable_recovery))
-                            ),
+                            83 + int(2 * (index + 1) / max(1, len(alignable_recovery))),
                             f"Aligning recovery {index + 1}/{len(alignable_recovery)}",
                         )
                         inference_started = time.monotonic()
@@ -940,8 +1509,7 @@ class TranscriptionPipeline:
                 sample_rate=audio_store.sample_rate,
             )
             remaining_hole_details = [
-                region.to_dict(audio_store.sample_rate)
-                for region in remaining_holes
+                region.to_dict(audio_store.sample_rate) for region in remaining_holes
             ]
             remaining_hole_seconds = round(
                 sum(
@@ -964,12 +1532,8 @@ class TranscriptionPipeline:
                 alignment_invalid_count=stats.alignment_invalid_count,
                 alignment_text_coverage=alignment_coverages,
                 recovery_success_count=stats.recovery_success_count,
-                cpu_self_repair_attempt_count=(
-                    stats.cpu_self_repair_attempt_count
-                ),
-                cpu_self_repair_success_count=(
-                    stats.cpu_self_repair_success_count
-                ),
+                cpu_self_repair_attempt_count=(stats.cpu_self_repair_attempt_count),
+                cpu_self_repair_success_count=(stats.cpu_self_repair_success_count),
                 remaining_coverage_hole_count=len(remaining_holes),
                 remaining_coverage_hole_seconds=remaining_hole_seconds,
                 remaining_coverage_holes=remaining_hole_details,

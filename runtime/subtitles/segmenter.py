@@ -127,6 +127,23 @@ def _trim_end_punctuation(text: str) -> str:
     return value
 
 
+def postprocess_subtitle_blocks(
+    blocks: list[SubtitleBlock],
+    *,
+    remove_gaps: bool = False,
+    trim_end_punctuation: bool = False,
+) -> list[SubtitleBlock]:
+    if trim_end_punctuation:
+        for block in blocks:
+            block.text = _trim_end_punctuation(block.text)
+    output = [block for block in blocks if block.text]
+    if remove_gaps:
+        for index in range(len(output) - 1):
+            if output[index + 1].start > output[index].start:
+                output[index].end = output[index + 1].start
+    return output
+
+
 def display_units(text: str) -> int:
     """Return the terminal-style visual width of rendered subtitle text."""
     width = wcswidth(text)
@@ -901,10 +918,11 @@ def segment_tokens(
         max_chars=character_limit,
     )
 
-    for block in blocks:
-        if trim_end_punctuation:
-            block.text = _trim_end_punctuation(block.text)
-    blocks = [block for block in blocks if block.text]
+    blocks = postprocess_subtitle_blocks(
+        blocks,
+        remove_gaps=False,
+        trim_end_punctuation=trim_end_punctuation,
+    )
 
     illegal_overflows = [
         block
@@ -918,8 +936,4 @@ def segment_tokens(
         raise AssertionError(
             "Subtitle text exceeded max_chars at a legal token boundary"
         )
-    if remove_gaps:
-        for index in range(len(blocks) - 1):
-            if blocks[index + 1].start > blocks[index].start:
-                blocks[index].end = blocks[index + 1].start
-    return blocks
+    return postprocess_subtitle_blocks(blocks, remove_gaps=remove_gaps)

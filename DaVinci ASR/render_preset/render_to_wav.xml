@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--DbAppVer="21.0.0b.0033" DbPrjVer="17"-->
-<SyRecordInfo DbId="a614dd9c-b9d8-47b6-ab78-1b8fdcc23b20">
- <FieldsBlob>000000010000000700000026005300750062007400690074006c0065005200650063006f007200640043006f00640065006300000002006d73633100000028005300750062007400690074006c0065004500780070006f007200740046006f0072006d006100740000000200000000030000002200520065006e0064006500720041007500640069006f0054007200610063006b00730000000c000000006f00000001000000010000000200300000000c000000005800000001000000020000001c0054007200610063006b0049006e0066006f00560061006c007500650000000200000000010000001a0054007200610063006b0049006e0066006f005400790070006500000002000000000100000024005200650063006f007200640056006900640065006f0045006e00610062006c006500640000000100000000002a005200650063006f007200640041007500640069006f00530061006d0070006c0065005200610074006500000002000000bb800000005e005200650063006f007200640041007500640069006f004e006f0072006d0061006c0069007a006100740069006f006e004f007500740070007500740054007200610063006b00730045006e00610062006c0065005300740061007400650000000c000000001700000001000000010000000200300000000200000000010000002800490073005200650063006f007200640041006c007000680061005000720065006d0075006c0074000000010001</FieldsBlob>
+<SyRecordInfo DbId="10b7d3b9-97e4-4eab-8f4d-ad54edcaa734">
+ <FieldsBlob>000000010000000a0000002a00550073006500540069006d0065006c0069006e0065005200650073006f006c007500740069006f006e00000001000100000026005300750062007400690074006c0065005200650063006f007200640043006f00640065006300000002006d73633100000028005300750062007400690074006c0065004500780070006f007200740046006f0072006d006100740000000200000000030000002200520065006e0064006500720041007500640069006f0054007200610063006b00730000000c000000006f00000001000000010000000200300000000c000000005800000001000000020000001c0054007200610063006b0049006e0066006f00560061006c007500650000000200000000010000001a0054007200610063006b0049006e0066006f005400790070006500000002000000000100000024005200650063006f007200640056006900640065006f0045006e00610062006c006500640000000100000000002a005200650063006f007200640041007500640069006f00530061006d0070006c0065005200610074006500000002000000bb800000005e005200650063006f007200640041007500640069006f004e006f0072006d0061006c0069007a006100740069006f006e004f007500740070007500740054007200610063006b00730045006e00610062006c0065005300740061007400650000000c000000001700000001000000010000000200300000000200000000010000001400500072006500730065007400540079007000650000000200000000120000002800490073005200650063006f007200640041006c007000680061005000720065006d0075006c0074000000010001000000240043007500730074006f006d00500072006500730065007400490063006f006e00490064000000020000000001</FieldsBlob>
  <Session/>
  <Timeline/>
  <UniqueSequenceId/>
@@ -13,7 +13,7 @@
  <RecordEndFrame>0</RecordEndFrame>
  <RecordTotalFrame>0</RecordTotalFrame>
  <RecordOldFrame>0</RecordOldFrame>
- <RecordNewFrame>0</RecordNewFrame>
+ <RecordNewFrame>90000</RecordNewFrame>
  <RecordAllowDupImg>1</RecordAllowDupImg>
  <RecordClipUniqueName>false</RecordClipUniqueName>
  <RecordClipUniqueNameStyle>0</RecordClipUniqueNameStyle>
@@ -24,13 +24,13 @@
  <FormatHeight>1080</FormatHeight>
  <FormatPixelAspectRatio>1</FormatPixelAspectRatio>
  <FormatOption>-1</FormatOption>
- <RecordTargetDir/>
+ <RecordTargetDir>/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/DaVinci-ASR/DaVinci ASR/audio_temp</RecordTargetDir>
  <RecordUseTgtTimeCode>1</RecordUseTgtTimeCode>
  <RenderAtSourceResolution>false</RenderAtSourceResolution>
  <RecordSetTimelineTimecode>false</RecordSetTimelineTimecode>
  <UseRecordClipStartFrame>false</UseRecordClipStartFrame>
  <RecordClipStartFrame>1</RecordClipStartFrame>
- <RecordPrefix>davinci_asr_audio_temp</RecordPrefix>
+ <RecordPrefix>Untitled</RecordPrefix>
  <RecordSuffix/>
  <RecordFormatType>wav</RecordFormatType>
  <RecordFormatSubType>lpcm</RecordFormatSubType>
@@ -39,7 +39,7 @@
  <RecordQuality>4</RecordQuality>
  <RecordFPS>25</RecordFPS>
  <StereoRender>false</StereoRender>
- <StereoRenderFrameMeshMode>0</StereoRenderFrameMeshMode>
+ <StereoRenderFrameMeshMode>-1</StereoRenderFrameMeshMode>
  <StereoRenderBothEyesSeparately>false</StereoRenderBothEyesSeparately>
  <StereoRenderSourceType>0</StereoRenderSourceType>
  <UserName/>
@@ -80,35 +80,15 @@
    <DbVal>y</DbVal>
   </Element>
   <Element>
-   <DbKey>aud_qual</DbKey>
-   <DbVal>4</DbVal>
-  </Element>
-  <Element>
-   <DbKey>aud_rate</DbKey>
-   <DbVal>64</DbVal>
-  </Element>
-  <Element>
    <DbKey>aud_codec</DbKey>
    <DbVal>lpcm</DbVal>
   </Element>
   <Element>
-   <DbKey>h264_level</DbKey>
+   <DbKey>subs_enable</DbKey>
    <DbVal>0</DbVal>
   </Element>
   <Element>
-   <DbKey>h264_passes</DbKey>
-   <DbVal>1</DbVal>
-  </Element>
-  <Element>
-   <DbKey>h264_bframes</DbKey>
-   <DbVal>1</DbVal>
-  </Element>
-  <Element>
-   <DbKey>h264_profile</DbKey>
-   <DbVal>0</DbVal>
-  </Element>
-  <Element>
-   <DbKey>h264_datarate</DbKey>
+   <DbKey>aud_discrete</DbKey>
    <DbVal>0</DbVal>
   </Element>
   <Element>
@@ -116,23 +96,15 @@
    <DbVal>AUX0</DbVal>
   </Element>
   <Element>
-   <DbKey>h264_iframefreq</DbKey>
-   <DbVal>0</DbVal>
-  </Element>
-  <Element>
-   <DbKey>h264_entropy_mode</DbKey>
-   <DbVal>0</DbVal>
+   <DbKey>single_wave_file</DbKey>
+   <DbVal>1</DbVal>
   </Element>
   <Element>
    <DbKey>imf_profile_level</DbKey>
    <DbVal>0</DbVal>
   </Element>
   <Element>
-   <DbKey>use_hw_acc_on_mac</DbKey>
-   <DbVal>1</DbVal>
-  </Element>
-  <Element>
-   <DbKey>aud_bitrate_strategy</DbKey>
+   <DbKey>immersive_workflow</DbKey>
    <DbVal>0</DbVal>
   </Element>
   <Element>
@@ -140,8 +112,8 @@
    <DbVal>0</DbVal>
   </Element>
   <Element>
-   <DbKey>h264_prioritize_speed</DbKey>
-   <DbVal>n</DbVal>
+   <DbKey>include_spatial_metadata</DbKey>
+   <DbVal>0</DbVal>
   </Element>
  </ExtraInfoMap>
  <UseRenderCachedImagesForRecording>false</UseRenderCachedImagesForRecording>

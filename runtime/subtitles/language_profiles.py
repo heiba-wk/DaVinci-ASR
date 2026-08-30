@@ -180,6 +180,16 @@ KOREAN_PHRASES = _phrases(
     "그럼에도 불구하고",
     "반면 에",
 )
+KOREAN_CLAUSE_ENDINGS = (
+    "지만",
+    "는데",
+    "은데",
+    "ㄴ데",
+    "거나",
+    "므로",
+    "으며",
+    "면서",
+)
 
 
 LANGUAGE_PROFILES = {
@@ -319,7 +329,7 @@ LANGUAGE_PROFILES = {
             "perché quando se sebbene mentre dopo prima finché dove che qualora"
         ),
         prepositions=_words(
-            "a da di in con su per tra fra contro durante senza verso oltre sotto sopra"
+            "a al allo alla ai agli alle da dal dallo dalla dai dagli dalle di del dello della dei degli delle in nel nello nella nei negli nelle con su sul sullo sulla sui sugli sulle per tra fra contro durante senza verso oltre sotto sopra"
         ),
         boundary_phrases=ITALIAN_PHRASES,
         protected_left=_words(
@@ -395,7 +405,7 @@ LANGUAGE_PROFILES = {
             "o a os as um uma uns umas este esta estes estas meu minha meus minhas seu sua seus suas eu tu ele ela nós vocês eles elas não nunca é são era eram ser pode podem deve devem tem têm tinha a com de em para por sem sobre"
         ),
         protected_right=_words(
-            "por cento reais euros gramas quilogramas miligramas metros quilômetros segundos minutos horas dias semanas meses anos"
+            "por cento reais euros gramas quilogramas miligramas metros quilômetros segundos minutos horas dias semanas meses anos vez vezes"
         ),
         protected_pairs=_pair_set(
             ("não", "só"),
@@ -449,7 +459,7 @@ LANGUAGE_PROFILES = {
             "el la los las un una unos unas este esta estos estas mi mis tu tus su sus yo tú él ella nosotros ustedes ellos ellas no nunca es son era eran ser puede pueden debe deben ha han había a con de en para por sin sobre"
         ),
         protected_right=_words(
-            "por ciento pesos euros gramos kilogramos miligramos metros kilómetros segundos minutos horas días semanas meses años"
+            "por ciento pesos euros gramos kilogramos miligramos metros kilómetros segundos minutos horas días semanas meses años vez veces"
         ),
         protected_pairs=_pair_set(
             ("no", "solo"),
@@ -529,6 +539,11 @@ def analyze_language_boundary(
     left = normalized[boundary_index - 1] if boundary_index > 0 else ""
     right = normalized[boundary_index] if boundary_index < len(normalized) else ""
     boundary_phrase = _phrase_at(normalized, boundary_index, profile.boundary_phrases)
+    korean_clause_ending = bool(
+        profile.language == "Korean"
+        and left
+        and left.endswith(KOREAN_CLAUSE_ENDINGS)
+    )
     protected_phrase = _phrase_crossing(
         normalized, boundary_index, profile.protected_phrases
     )
@@ -553,10 +568,10 @@ def analyze_language_boundary(
         before_conjunction=right in profile.conjunctions,
         before_subordinate=right in profile.subordinates,
         before_preposition=right in profile.prepositions,
-        boundary_phrase=bool(boundary_phrase),
+        boundary_phrase=bool(boundary_phrase or korean_clause_ending),
         protected_boundary=bool(reasons),
         protected_phrase=bool(protected_phrase),
-        matched_boundary_phrase=boundary_phrase,
+        matched_boundary_phrase=(left,) if korean_clause_ending else boundary_phrase,
         matched_protected_phrase=protected_phrase,
         protection_reasons=tuple(dict.fromkeys(reasons)),
     )

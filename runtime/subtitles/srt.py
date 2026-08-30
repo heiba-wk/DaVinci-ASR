@@ -13,22 +13,29 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def render_srt(blocks: list[SubtitleBlock]) -> str:
+def render_srt(blocks: list[SubtitleBlock], *, preserve_text: bool = False) -> str:
     parts: list[str] = []
     for index, block in enumerate(blocks, 1):
-        text = block.text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        text = block.text.replace("\r\n", "\n").replace("\r", "\n")
+        if not preserve_text:
+            text = text.strip()
         parts.append(
             f"{index}\n{format_timestamp(block.start)} --> {format_timestamp(block.end)}\n{text}\n"
         )
     return "\n".join(parts)
 
 
-def write_srt(path: str | Path, blocks: list[SubtitleBlock]) -> Path:
+def write_srt(
+    path: str | Path,
+    blocks: list[SubtitleBlock],
+    *,
+    preserve_text: bool = False,
+) -> Path:
     output = Path(path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write(render_srt(blocks))
+        stream.write(render_srt(blocks, preserve_text=preserve_text))
         stream.flush()
     temporary.replace(output)
     return output

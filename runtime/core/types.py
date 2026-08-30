@@ -5,11 +5,14 @@ from pathlib import Path
 from typing import Any
 
 from runtime.constants import (
+    AUTO_SUBTITLE_MODE,
     ASR_MODEL_KEY,
     ASR_MODEL_KEYS,
     INTERFACE_LANGUAGES,
     JOB_STATES,
     PROTOCOL_VERSION,
+    SCRIPT_MATCH_MODE,
+    TRANSCRIPTION_MODES,
     UI_LANGUAGES,
 )
 
@@ -51,9 +54,11 @@ class JobRequest:
     protocol: int
     job_id: str
     action: str
+    mode: str = AUTO_SUBTITLE_MODE
     audio_path: str = ""
     language: str = "Auto"
     prompt: str = ""
+    reference_text: str = ""
     ui_language: str = "cn"
     asr_model: str = ASR_MODEL_KEY
     download_source: str = ""
@@ -92,21 +97,32 @@ class JobRequest:
         audio_path = str(value.get("audio_path", ""))
         if action == "transcribe" and not audio_path:
             raise ValueError("audio_path is required for transcribe")
+        mode = str(value.get("mode", AUTO_SUBTITLE_MODE)).strip()
+        if mode not in TRANSCRIPTION_MODES:
+            raise ValueError(f"Unsupported transcription mode: {mode}")
+        raw_reference = value.get("reference_text", "")
+        reference_text = "" if raw_reference is None else str(raw_reference)
+        if (
+            action == "transcribe"
+            and mode == SCRIPT_MATCH_MODE
+            and not any(line.strip() for line in reference_text.splitlines())
+        ):
+            raise ValueError("reference_text requires at least one non-empty line")
         download_source = str(value.get("download_source", "")).strip()
         if action == "download_models" and download_source not in {
             "huggingface",
             "modelscope",
         }:
-            raise ValueError(
-                "download_source must be 'huggingface' or 'modelscope'"
-            )
+            raise ValueError("download_source must be 'huggingface' or 'modelscope'")
         return cls(
             protocol=protocol,
             job_id=job_id,
             action=action,
+            mode=mode,
             audio_path=audio_path,
             language=language,
             prompt=str(value.get("prompt", "")),
+            reference_text=reference_text,
             ui_language=ui_language,
             asr_model=asr_model,
             download_source=download_source,
