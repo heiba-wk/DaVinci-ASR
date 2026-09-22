@@ -1377,11 +1377,29 @@ do
                 context.project:SetCurrentRenderMode(previousMode)
             end
         end
-        Core.resolve:ImportRenderPreset(Config.RENDER_PRESET_FILE)
-        if context.project:LoadRenderPreset(Config.RENDER_PRESET_NAME) ~= true then
+        local audioViewCallOk, audioViewEnabled = pcall(function()
+            return context.project:SetRenderSettings({
+                ExportVideo = false,
+                ExportAudio = true
+            })
+        end)
+        if not audioViewCallOk or audioViewEnabled ~= true then
             restorePreviousSelection()
             self:returnToEditPage()
-            return nil, "Resolve could not load the bundled render_to_wav preset."
+            return nil, "Resolve could not enable audio export before loading render_to_wav.xml: "
+                .. tostring(audioViewEnabled)
+        end
+        pcall(function()
+            context.project:DeleteRenderPreset(Config.RENDER_PRESET_NAME)
+        end)
+        local importCallOk, imported = pcall(function()
+            return Core.resolve:ImportRenderPreset(Config.RENDER_PRESET_FILE)
+        end)
+        if not importCallOk or imported ~= true then
+            restorePreviousSelection()
+            self:returnToEditPage()
+            return nil, "Resolve could not import the bundled render_to_wav.xml preset: "
+                .. tostring(imported)
         end
         local settings = {
             SelectAllFrames = cacheState.selectAllFrames ~= false,

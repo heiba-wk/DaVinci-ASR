@@ -49,12 +49,12 @@
       "directory": "Qwen3-ForcedAligner-0.6B-hf",
       "license": "Apache-2.0",
       "files": [
-        {"path": "chat_template.jinja", "size": 551},
-        {"path": "config.json", "size": 248029},
+        {"path": "chat_template.jinja", "size": 551, "sha256": "59b5ae119bda7c00089bba5f49af775791ea67c7aeb7d2b828cddda9463121bf"},
+        {"path": "config.json", "size": 248029, "sha256": "82ac390b36a8f80c5a0c4e202367debd149e5d8c30abe4cf5eed439101b1c5ce"},
         {"path": "model.safetensors", "size": 1835545960, "sha256": "00568245ceca5af1991d28562a75fe1ddc9bfeb041c27fda66947ea05c47fb86"},
-        {"path": "processor_config.json", "size": 487},
+        {"path": "processor_config.json", "size": 487, "sha256": "bc0b230081b44e629dd5b9045b78495615c1831b4b9f4cffe97bd37e82a6156a"},
         {"path": "tokenizer.json", "size": 11429842, "sha256": "cadfb9cbd9ff8f4e309075ec6a71b063295ff796afb4b5dbc0fd2873fbb301f2"},
-        {"path": "tokenizer_config.json", "size": 998}
+        {"path": "tokenizer_config.json", "size": 998, "sha256": "945e980986de2ca7768f3326bfdbb4fbea3406f972b8ae0be233089f2b253c11"}
       ]
     }
   ]

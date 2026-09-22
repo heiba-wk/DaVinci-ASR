@@ -17,8 +17,9 @@ resolve a PyTorch wheel that bundles its CUDA runtime; users must never install 
 CUDA Toolkit or cuDNN separately.
 
 Every regenerated lock must include `jieba==0.42.1`, `wcwidth==0.2.13`,
-`modelscope-hub>=0.1.8`, `silero-vad==6.2.1`, `torchaudio==2.9.0`, and all of
+`modelscope-hub>=0.1.8`, `omnivad==0.2.13`, `torchaudio==2.9.0`, and all of
 their transitive dependencies. TorchAudio must match the pinned `torch==2.9.0`
-ABI. The lock's wheel hash covers Silero's packaged JIT weight. The macOS and
-Windows PyInstaller builds collect these packages from their private Runtime
-environments; never install them into Resolve's or the system's Python.
+ABI. The lock's wheel hash covers OmniVAD's native library and bundled VAD
+model. The macOS and Windows PyInstaller builds collect these packages from
+their private Runtime environments; never install them into Resolve's or the
+system's Python.

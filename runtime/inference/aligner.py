@@ -98,12 +98,15 @@ def _tokens_from_decoded_alignment(
     input_start: float,
     input_end: float,
     boundary_tolerance_seconds: float = 0.0,
+    timestamp_resolution_seconds: float = 0.08,
 ) -> tuple[list[TimedToken], str]:
-    """Preserve decoder units while borrowing only reliable time intervals."""
+    """Preserve decoder units and reconstruct collapsed model anchors in place."""
     if boundary_tolerance_seconds < 0.0:
         raise ValueError("Alignment boundary tolerance cannot be negative")
+    if timestamp_resolution_seconds <= 0.0:
+        raise ValueError("Alignment timestamp resolution must be positive")
     tokens: list[TimedToken] = []
-    pending_text: list[str] = []
+    pending: list[tuple[str, float]] = []
     pending_first_index = -1
     previous_start = input_start
     previous_end = input_start
@@ -141,51 +144,44 @@ def _tokens_from_decoded_alignment(
         text = str(item.get("text", ""))
 
         if end <= start + 1e-9:
-            if not pending_text:
+            if not pending:
                 pending_first_index = index
-            pending_text.append(text)
+            pending.append((text, start))
             continue
 
-        if pending_text:
-            # The upstream decoder intentionally repairs timestamps to a
-            # non-decreasing sequence, so a real text unit can retain only an
-            # anchor. Preserve every decoder occurrence and let each one share
-            # the following reliable interval. Rendering decides later whether
-            # adjacent units need spaces; alignment repair must not join text.
-            tokens.extend(
-                TimedToken(pending, start, end) for pending in pending_text
-            )
-            pending_text.clear()
+        if pending:
+            # 零时长仍是 Forced Aligner 的时间锚点。按模型时间栅格在原位
+            # 恢复最小合法区间，不能跨真实静音借用下一个词的整段时间。
+            for pending_text, anchor in pending:
+                forward_limit = start if start > anchor + 1e-9 else end
+                repaired_end = min(
+                    anchor + timestamp_resolution_seconds,
+                    forward_limit,
+                    input_end,
+                )
+                if repaired_end <= anchor + 1e-9:
+                    return [], f"INVALID_INTERVAL:{pending_first_index}"
+                tokens.append(TimedToken(pending_text, anchor, repaired_end))
+            pending.clear()
             pending_first_index = -1
         tokens.append(TimedToken(text, start, end))
 
-    if pending_text:
+    for pending_text, anchor in pending:
+        forward_end = min(anchor + timestamp_resolution_seconds, input_end)
+        if forward_end > anchor + 1e-9:
+            tokens.append(TimedToken(pending_text, anchor, forward_end))
+            continue
         if not tokens:
             return [], f"INVALID_INTERVAL:{pending_first_index}"
         previous = tokens[-1]
-        tokens.extend(
-            TimedToken(pending, previous.start, previous.end)
-            for pending in pending_text
+        repaired_start = max(
+            anchor - timestamp_resolution_seconds,
+            previous.start,
+            input_start,
         )
-
-    if (
-        len(tokens) >= 2
-        and input_start > 0.0
-        and abs(tokens[0].start - input_start) <= 1e-6
-        and tokens[0].end - tokens[0].start <= 0.25
-        and tokens[1].start - tokens[0].end >= 1.0
-    ):
-        # A repaired aligner outlier can become a short positive interval at
-        # the arbitrary input boundary, far ahead of the next reliable unit.
-        # Preserve the decoder occurrence but attach it to that reliable
-        # interval, just as for a zero-duration anchor above.
-        first = tokens[0]
-        following = tokens[1]
-        tokens[0] = TimedToken(
-            first.text,
-            following.start,
-            following.end,
-        )
+        if anchor <= repaired_start + 1e-9:
+            return [], f"INVALID_INTERVAL:{pending_first_index}"
+        tokens.append(TimedToken(pending_text, repaired_start, anchor))
     return tokens, ""
 
 
@@ -280,6 +276,10 @@ class QwenForcedAlignerEngine:
             boundary_tolerance_seconds=_alignment_boundary_tolerance_seconds(
                 self.processor
             ),
+            timestamp_resolution_seconds=float(
+                self.processor.timestamp_segment_time
+            )
+            / 1000.0,
         )
         if decode_error:
             return AlignmentResult([], 0.0, False, decode_error)

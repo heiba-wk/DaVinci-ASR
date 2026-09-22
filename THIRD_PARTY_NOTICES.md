@@ -35,15 +35,22 @@ file and the license files emitted by the hashed dependency lock.
 - Model weights remain outside both the Git source repository and release
   installers; separately supplied files are verified by the model manifest.
 
-## Silero VAD
+## OmniVAD
 
-- Project: <https://github.com/snakers4/silero-vad>
-- Package: `silero-vad==6.2.1`
-- Copyright: Silero Team
-- License: MIT
-- Use in this project: offline speech-region detection. The pip wheel supplies
-  the JIT weight; release locks verify the wheel hash and Runtime never uses
-  `torch.hub` to fetch VAD code or weights.
+- Project: <https://github.com/lifeiteng/OmniVAD-Kit>
+- Package: `omnivad==0.2.13`
+- Copyright: FeiTeng Li and OmniVAD contributors
+- License: Apache License 2.0
+- Use in this project: offline speech-region detection and per-frame speech
+  probability analysis. The platform wheel supplies the native library and
+  bundled VAD model; Runtime performs no VAD model download.
+
+## ncnn
+
+- Project: <https://github.com/Tencent/ncnn>
+- Copyright: Tencent
+- License: BSD 3-Clause
+- Use in this project: native inference backend bundled by the OmniVAD wheel.
 
 ## Hugging Face Transformers
 

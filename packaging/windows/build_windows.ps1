@@ -70,7 +70,7 @@ function Build-Runtime {
         "--collect-all", "jieba",
         "--collect-all", "nagisa",
         "--collect-all", "modelscope_hub",
-        "--collect-all", "silero_vad",
+        "--collect-all", "omnivad",
         "--add-data", "$(Join-Path $ProjectRoot 'models\manifest.json');models",
         (Join-Path $ProjectRoot "runtime\main.py")
     )

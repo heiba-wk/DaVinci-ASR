@@ -114,7 +114,7 @@ PYINSTALLER_ARGS=(
     --collect-all jieba
     --collect-all nagisa
     --collect-all modelscope_hub
-    --collect-all silero_vad
+    --collect-all omnivad
     --add-data "$PROJECT_ROOT/models/manifest.json:models"
 )
 if [[ "$MODE" == "signed" ]]; then

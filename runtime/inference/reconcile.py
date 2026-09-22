@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from runtime.audio.chunker import InferenceWindow
@@ -163,9 +164,7 @@ def intersect_speech_regions(
         start = max(speech.start_sample, region.start_sample)
         end = min(speech.end_sample, region.end_sample)
         if end > start:
-            intersections.append(
-                SpeechRegion(start, end, speech.confidence)
-            )
+            intersections.append(SpeechRegion(start, end, speech.confidence))
     return intersections
 
 
@@ -228,6 +227,68 @@ def find_unclaimed_speech_regions(
             for start, end in claimed
         )
     ]
+
+
+def find_unclaimed_speech_edges(
+    speech_regions: list[SpeechRegion],
+    candidates: list[TokenCandidate],
+    sample_rate: int,
+    minimum_edge_seconds: float,
+) -> list[SpeechRegion]:
+    """Return whole unclaimed islands and substantial uncovered suffixes.
+
+    Once an atomic speech island owns a token, an uncovered prefix or internal
+    gap is ambiguous phonetic lead-in rather than evidence of missing text.
+    Only the suffix after the last claimed token is safe to recover.
+    """
+    if (
+        sample_rate <= 0
+        or not math.isfinite(minimum_edge_seconds)
+        or minimum_edge_seconds < 0
+    ):
+        raise ValueError("Invalid atomic speech coverage bounds")
+    minimum_samples = max(1, int(round(minimum_edge_seconds * sample_rate)))
+    claims: list[tuple[int, int]] = []
+    for candidate in candidates:
+        if not normalize_alignment_text(candidate.token.text):
+            continue
+        start = max(
+            int(round(candidate.core_start * sample_rate)),
+            int(round(candidate.token.start * sample_rate)),
+        )
+        end = min(
+            int(round(candidate.core_end * sample_rate)),
+            int(round(candidate.token.end * sample_rate)),
+        )
+        if end > start:
+            claims.append((start, end))
+    claims.sort()
+
+    output: list[SpeechRegion] = []
+    for region in speech_regions:
+        last_claimed_end: int | None = None
+        for start, end in claims:
+            if end <= region.start_sample:
+                continue
+            if start >= region.end_sample:
+                break
+            clipped_end = min(end, region.end_sample)
+            last_claimed_end = (
+                clipped_end
+                if last_claimed_end is None
+                else max(last_claimed_end, clipped_end)
+            )
+        if last_claimed_end is None:
+            output.append(region)
+        elif region.end_sample - last_claimed_end >= minimum_samples:
+            output.append(
+                SpeechRegion(
+                    last_claimed_end,
+                    region.end_sample,
+                    region.confidence,
+                )
+            )
+    return output
 
 
 def split_recovery_regions(

@@ -13,7 +13,7 @@ authors = [{ name = "HEIBA" }]
 dependencies = [
     "jieba==0.42.1",
     "modelscope-hub>=0.1.8",
-    "silero-vad==6.2.1",
+    "omnivad==0.2.13",
     "torchaudio==2.9.0",
     "wcwidth==0.2.13",
 ]

@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from wcwidth import wcswidth, wcwidth
 
+from runtime.audio.chunker import probability_valleys
+from runtime.audio.vad import SpeechProbabilityTrack
+from runtime.constants import (
+    VAD_MIN_SILENCE_MS,
+    WINDOW_VALLEY_MIN_SECONDS,
+    WINDOW_VALLEY_SMOOTH_FRAMES,
+    WINDOW_VALLEY_THRESHOLD,
+)
 from runtime.core.types import SubtitleBlock, TimedToken
 from runtime.subtitles.language_profiles import (
     NO_SPACE_LANGUAGES,
@@ -47,6 +55,9 @@ DP_SHORT_BLOCK_RATIO = 0.35
 DP_SHORT_BLOCK_PENALTY = 60
 PREFERRED_BOUNDARY_BONUS = 30
 CJK_PREFERRED_BOUNDARY_BONUS = 140
+ACOUSTIC_EVIDENCE_SECONDS = VAD_MIN_SILENCE_MS / 1000.0
+ABSOLUTE_ACOUSTIC_BREAK_SECONDS = 3.0
+MIN_ACOUSTIC_FRAGMENT_LEXICAL_CHARACTERS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,13 +100,82 @@ def _is_opening_punctuation(char: str) -> bool:
     return bool(char) and unicodedata.category(char) in {"Ps", "Pi"}
 
 
+def _is_cjk_script_character(char: str) -> bool:
+    codepoint = ord(char)
+    return bool(
+        0x1100 <= codepoint <= 0x11FF
+        or 0x2E80 <= codepoint <= 0x2FFF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0x3100 <= codepoint <= 0x31BF
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xA960 <= codepoint <= 0xA97F
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xD7B0 <= codepoint <= 0xD7FF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0xFF65 <= codepoint <= 0xFF9F
+        or 0x20000 <= codepoint <= 0x2FA1F
+        or 0x30000 <= codepoint <= 0x323AF
+    )
+
+
+def _is_non_cjk_lexical_token(text: str) -> bool:
+    return bool(
+        text
+        and not any(_is_cjk_script_character(char) for char in text)
+        and any(char.isalnum() for char in text)
+    )
+
+
+def _is_single_non_cjk_alphanumeric_token(text: str) -> bool:
+    return bool(
+        len(text) == 1 and text.isalnum() and not _is_cjk_script_character(text)
+    )
+
+
+def _is_decimal_token_continuation(previous: str, current: str) -> bool:
+    return bool(
+        len(previous) >= 2
+        and previous[-1] in {".", "．"}
+        and previous[:-1].isnumeric()
+        and current
+        and current[0].isnumeric()
+    )
+
+
+def _is_thousands_group_continuation(previous: str, current: str) -> bool:
+    if len(previous) < 2 or previous[-1] != "," or not previous[:-1].isnumeric():
+        return False
+    leading_digits = 0
+    for character in current:
+        if not character.isnumeric():
+            break
+        leading_digits += 1
+    return leading_digits == 3
+
+
 def _joiner(previous: str, current: str, language: str) -> str:
-    if language in NO_SPACE_LANGUAGES:
-        return ""
     if not previous or not current:
         return ""
     if _is_closing_punctuation(current[0]) or _is_opening_punctuation(previous[-1]):
         return ""
+    if language in NO_SPACE_LANGUAGES:
+        if (
+            (
+                _is_single_non_cjk_alphanumeric_token(previous)
+                and _is_single_non_cjk_alphanumeric_token(current)
+            )
+            or _is_decimal_token_continuation(previous, current)
+            or _is_thousands_group_continuation(previous, current)
+        ):
+            return ""
+        return (
+            " "
+            if _is_non_cjk_lexical_token(previous)
+            and _is_non_cjk_lexical_token(current)
+            else ""
+        )
     return " "
 
 
@@ -349,6 +429,7 @@ class SegmentationContext:
     lexical_units: tuple[str, ...]
     boundary_left_words: tuple[str, ...]
     boundary_right_words: tuple[str, ...]
+    acoustic_pause_seconds: tuple[float, ...]
 
     def word_count(self, start: int, end: int) -> int:
         return self.prefix_word_counts[end] - self.prefix_word_counts[start]
@@ -440,6 +521,63 @@ def _segmentation_context(
         lexical_units=lexical_units,
         boundary_left_words=tuple(boundary_left_words),
         boundary_right_words=tuple(boundary_right_words),
+        acoustic_pause_seconds=tuple(0.0 for _ in offsets),
+    )
+
+
+def _add_acoustic_pause_evidence(
+    context: SegmentationContext,
+    probabilities: SpeechProbabilityTrack,
+    sample_rate: int,
+) -> SegmentationContext:
+    if sample_rate <= 0:
+        raise ValueError("Acoustic segmentation sample rate must be positive")
+    valleys = probability_valleys(
+        probabilities,
+        sample_rate=sample_rate,
+        threshold=WINDOW_VALLEY_THRESHOLD,
+        min_seconds=WINDOW_VALLEY_MIN_SECONDS,
+        smooth_frames=WINDOW_VALLEY_SMOOTH_FRAMES,
+    )
+    acoustic_pauses = list(context.acoustic_pause_seconds)
+    safe_boundaries = list(context.safe_boundaries)
+    for boundary_index in range(1, len(context.tokens)):
+        gap_start = max(
+            0,
+            min(
+                int(round(context.tokens[boundary_index - 1].end * sample_rate)),
+                probabilities.total_samples,
+            ),
+        )
+        gap_end = max(
+            0,
+            min(
+                int(round(context.tokens[boundary_index].start * sample_rate)),
+                probabilities.total_samples,
+            ),
+        )
+        if gap_end <= gap_start:
+            continue
+        low_probability_samples = max(
+            (
+                max(
+                    0,
+                    min(valley.end_sample, gap_end)
+                    - max(valley.start_sample, gap_start),
+                )
+                for valley in valleys
+            ),
+            default=0,
+        )
+        acoustic_pause_seconds = low_probability_samples / float(sample_rate)
+        if acoustic_pause_seconds >= ACOUSTIC_EVIDENCE_SECONDS:
+            acoustic_pauses[boundary_index] = acoustic_pause_seconds
+        if acoustic_pause_seconds >= ABSOLUTE_ACOUSTIC_BREAK_SECONDS:
+            safe_boundaries[boundary_index] = True
+    return replace(
+        context,
+        safe_boundaries=tuple(safe_boundaries),
+        acoustic_pause_seconds=tuple(acoustic_pauses),
     )
 
 
@@ -547,7 +685,10 @@ def _character_boundary_features(
             clause_end=(
                 _ends_with(current_text, CLAUSE_END) and not numeric_continuation
             ),
-            pause_seconds=_pause_seconds(current, following),
+            pause_seconds=max(
+                _pause_seconds(current, following),
+                context.acoustic_pause_seconds[boundary_index],
+            ),
             before_conjunction=analysis.before_conjunction,
             before_subordinate=analysis.before_subordinate,
             before_preposition=analysis.before_preposition,
@@ -569,6 +710,66 @@ def _character_boundary_features(
     )
 
 
+def _has_hard_semantic_protection(
+    context: SegmentationContext,
+    boundary_index: int,
+    features: BoundaryFeatures,
+) -> bool:
+    return bool(
+        features.protected_phrase
+        or any(
+            reason
+            in {
+                "number_unit",
+                "numeric_continuation",
+                "protected_pair",
+                "protected_phrase",
+                "correlative_pair",
+            }
+            for reason in features.protection_reasons
+        )
+    )
+
+
+def _lexical_character_count(
+    context: SegmentationContext,
+    start_index: int,
+    end_index: int,
+) -> int:
+    start_offset = context.boundary_offsets[start_index]
+    end_offset = context.boundary_offsets[end_index]
+    return sum(
+        character.isalnum()
+        for character in context.rendered_text[start_offset:end_offset]
+    )
+
+
+def _acoustic_boundary_creates_orphan(
+    context: SegmentationContext,
+    region_start: int,
+    boundary_index: int,
+) -> bool:
+    if (
+        _lexical_character_count(context, region_start, boundary_index)
+        < MIN_ACOUSTIC_FRAGMENT_LEXICAL_CHARACTERS
+    ):
+        return True
+
+    fragment_end = boundary_index
+    while fragment_end < len(context.tokens):
+        fragment_end += 1
+        if not context.safe_boundaries[fragment_end]:
+            continue
+        if (
+            _lexical_character_count(context, boundary_index, fragment_end)
+            >= MIN_ACOUSTIC_FRAGMENT_LEXICAL_CHARACTERS
+        ):
+            return False
+        if _ends_with(context.tokens[fragment_end - 1].text, SENTENCE_END):
+            return True
+    return True
+
+
 def _planning_region_end(
     context: SegmentationContext,
     start_index: int,
@@ -586,10 +787,73 @@ def _planning_region_end(
     last_safe = start_index
     cap_boundary: tuple[int, int] | None = None
     while end_index < len(context.tokens):
+        if (
+            end_index > start_index
+            and context.acoustic_pause_seconds[end_index]
+            >= ABSOLUTE_ACOUSTIC_BREAK_SECONDS
+        ):
+            return end_index
         if end_index > start_index and context.safe_boundaries[end_index]:
+            creates_orphan = _acoustic_boundary_creates_orphan(
+                context,
+                start_index,
+                end_index,
+            )
             pause = _pause_seconds(
                 context.tokens[end_index - 1], context.tokens[end_index]
             )
+            protects_orphan = bool(
+                creates_orphan
+                and pause < FORCED_PAUSE_SECONDS
+                and context.acoustic_pause_seconds[end_index] < FORCED_PAUSE_SECONDS
+            )
+            if context.acoustic_pause_seconds[end_index] >= ACOUSTIC_EVIDENCE_SECONDS:
+                features, _ = _character_boundary_features(
+                    context,
+                    end_index,
+                    region_start=start_index,
+                    region_end=len(context.tokens),
+                    max_chars=max_chars,
+                )
+                semantic_boundary = bool(
+                    features.sentence_end
+                    or features.clause_end
+                    or features.before_conjunction
+                    or features.before_subordinate
+                    or features.before_preposition
+                    or features.boundary_phrase
+                )
+                completed_protected_left_span = False
+                if end_index > start_index + 1:
+                    left_features, _ = _character_boundary_features(
+                        context,
+                        end_index - 1,
+                        region_start=start_index,
+                        region_end=len(context.tokens),
+                        max_chars=max_chars,
+                    )
+                    completed_protected_left_span = _has_hard_semantic_protection(
+                        context,
+                        end_index - 1,
+                        left_features,
+                    )
+                strong_acoustic_boundary = bool(
+                    context.acoustic_pause_seconds[end_index] >= STRONG_PAUSE_SECONDS
+                )
+                if (
+                    (
+                        semantic_boundary
+                        or completed_protected_left_span
+                        or strong_acoustic_boundary
+                    )
+                    and not protects_orphan
+                    and not _has_hard_semantic_protection(
+                        context,
+                        end_index,
+                        features,
+                    )
+                ):
+                    return end_index
             if pause >= FORCED_PAUSE_SECONDS:
                 left_words = context.word_count(start_index, end_index)
                 right_words = context.word_count(end_index, len(context.tokens))
@@ -748,6 +1012,27 @@ def _joined_block_text(
     return (left.text + _joiner(left.text, right.text, language) + right.text).strip()
 
 
+def _block_sentence_boundary(
+    left: SubtitleBlock,
+    right: SubtitleBlock,
+    language: str,
+) -> bool:
+    return _is_sentence_boundary(
+        TimedToken(left.text, left.start, left.end),
+        TimedToken(right.text, right.start, right.end),
+        language,
+    )
+
+
+def _indistinguishable_intervals(
+    left: SubtitleBlock,
+    right: SubtitleBlock,
+) -> bool:
+    return bool(
+        abs(left.start - right.start) <= 1.0e-9 and abs(left.end - right.end) <= 1.0e-9
+    )
+
+
 def _coalesce_overlapping_blocks(
     blocks: list[SubtitleBlock],
     *,
@@ -762,6 +1047,12 @@ def _coalesce_overlapping_blocks(
             left = working[index]
             right = working[index + 1]
             if right.start + 1e-9 >= left.end:
+                continue
+            if _block_sentence_boundary(
+                left,
+                right,
+                language,
+            ) and not _indistinguishable_intervals(left, right):
                 continue
             combined = _joined_block_text(left, right, language)
             if display_units(combined) > max_chars:
@@ -796,6 +1087,10 @@ def _coalesce_overlapping_blocks(
                 not mostly_consumed
                 or not following_is_near
                 or display_units(combined) > max_chars
+                or (
+                    _block_sentence_boundary(current, following, language)
+                    and not _indistinguishable_intervals(current, following)
+                )
             ):
                 continue
             working[index : index + 2] = [
@@ -868,6 +1163,45 @@ def segment_tokens(
     remove_gaps: bool = False,
     trim_end_punctuation: bool = False,
 ) -> list[SubtitleBlock]:
+    return _segment_tokens_with_acoustic_input(
+        tokens,
+        language=language,
+        max_chars=max_chars,
+        remove_gaps=remove_gaps,
+        trim_end_punctuation=trim_end_punctuation,
+        acoustic=None,
+    )
+
+
+def segment_tokens_with_speech_probabilities(
+    tokens: list[TimedToken],
+    *,
+    language: str,
+    max_chars: int,
+    probabilities: SpeechProbabilityTrack,
+    sample_rate: int,
+    remove_gaps: bool = False,
+    trim_end_punctuation: bool = False,
+) -> list[SubtitleBlock]:
+    return _segment_tokens_with_acoustic_input(
+        tokens,
+        language=language,
+        max_chars=max_chars,
+        remove_gaps=remove_gaps,
+        trim_end_punctuation=trim_end_punctuation,
+        acoustic=(probabilities, sample_rate),
+    )
+
+
+def _segment_tokens_with_acoustic_input(
+    tokens: list[TimedToken],
+    *,
+    language: str,
+    max_chars: int,
+    remove_gaps: bool,
+    trim_end_punctuation: bool,
+    acoustic: tuple[SpeechProbabilityTrack, int] | None,
+) -> list[SubtitleBlock]:
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
     if not tokens:
@@ -882,6 +1216,8 @@ def segment_tokens(
                 "reorder model-provided text"
             )
     context = _segmentation_context(ordered, language)
+    if acoustic is not None:
+        context = _add_acoustic_pause_evidence(context, acoustic[0], acoustic[1])
     blocks: list[SubtitleBlock] = []
     atomic_overflow_intervals: set[tuple[float, float]] = set()
     start_index = 0

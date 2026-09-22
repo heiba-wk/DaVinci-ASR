@@ -20,6 +20,7 @@ FALLBACK_MIN_GLOBAL_ANCHOR_COVERAGE = 0.50
 FALLBACK_MIN_ALIGNMENT_COVERAGE = 0.95
 FALLBACK_MIN_MAPPING_COVERAGE = 0.95
 FALLBACK_WINDOW_MIN_SECONDS = 0.01
+FALLBACK_ALIGNMENT_MIN_WINDOW_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,13 @@ class AnchorPlan:
     mapping_coverage: float
     line_coverages: list[float]
     unmapped_line_indices: list[int]
+
+
+@dataclass(slots=True)
+class AnchorWindowStabilization:
+    windows: list[AnchorWindow]
+    collapsed_line_indices: list[int]
+    minimum_window_seconds: float
 
 
 def parse_reference_lines(reference_text: str) -> list[ScriptLine]:
@@ -503,3 +511,79 @@ def build_anchor_plan(
         line_coverages=line_coverages,
         unmapped_line_indices=unmapped,
     )
+
+
+def stabilize_anchor_windows(
+    windows: list[AnchorWindow],
+    *,
+    duration: float,
+    minimum_window_seconds: float = FALLBACK_ALIGNMENT_MIN_WINDOW_SECONDS,
+) -> AnchorWindowStabilization:
+    """Expand collapsed local-alignment windows without breaking their ordering."""
+    if duration <= 0.0:
+        raise ValueError("SCRIPT_MATCH_AUDIO_EMPTY")
+    if minimum_window_seconds <= 0.0:
+        raise ValueError("SCRIPT_MATCH_FALLBACK_WINDOW_MINIMUM_INVALID")
+    if not windows:
+        return AnchorWindowStabilization([], [], 0.0)
+
+    target = min(minimum_window_seconds, duration / len(windows))
+    collapsed = [
+        index
+        for index, window in enumerate(windows)
+        if window.end - window.start + 1e-9 < target
+    ]
+    if not collapsed:
+        return AnchorWindowStabilization(list(windows), [], target)
+
+    boundaries = [windows[0].start, *(window.end for window in windows)]
+    transformed_ceiling = max(0.0, duration - len(windows) * target)
+    transformed = [
+        min(
+            transformed_ceiling,
+            max(0.0, boundary - index * target),
+        )
+        for index, boundary in enumerate(boundaries[1:-1], 1)
+    ]
+
+    # Pool Adjacent Violators gives the least-squares boundary adjustment under
+    # the minimum-spacing constraint. Endpoints stay fixed at 0 and duration.
+    blocks: list[list[float | int]] = []
+    for index, value in enumerate(transformed):
+        blocks.append([index, index, value, 1])
+        while len(blocks) >= 2:
+            left = blocks[-2]
+            right = blocks[-1]
+            left_mean = float(left[2]) / int(left[3])
+            right_mean = float(right[2]) / int(right[3])
+            if left_mean <= right_mean:
+                break
+            blocks[-2:] = [
+                [
+                    int(left[0]),
+                    int(right[1]),
+                    float(left[2]) + float(right[2]),
+                    int(left[3]) + int(right[3]),
+                ]
+            ]
+
+    fitted = [0.0] * len(transformed)
+    for start, end, total, count in blocks:
+        mean = float(total) / int(count)
+        for index in range(int(start), int(end) + 1):
+            fitted[index] = mean
+    stable_boundaries = [0.0]
+    stable_boundaries.extend(
+        value + index * target for index, value in enumerate(fitted, 1)
+    )
+    stable_boundaries.append(duration)
+    stable_windows = [
+        AnchorWindow(
+            line=window.line,
+            start=stable_boundaries[index],
+            end=stable_boundaries[index + 1],
+            anchor_coverage=window.anchor_coverage,
+        )
+        for index, window in enumerate(windows)
+    ]
+    return AnchorWindowStabilization(stable_windows, collapsed, target)

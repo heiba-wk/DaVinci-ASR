@@ -4,15 +4,23 @@ import json
 import logging
 import shutil
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol
 
 from runtime.audio.chunker import InferenceWindow, plan_windows
 from runtime.audio.store import AudioStore, prepare_audio_store
-from runtime.audio.vad import SileroVAD, SpeechRegion
+from runtime.audio.vad import (
+    OmniVAD,
+    SpeechProbabilityTrack,
+    SpeechRegion,
+    VADAnalysis,
+    atomic_speech_regions_from_probabilities,
+)
 from runtime.constants import (
     AUTO_SUBTITLE_MODE,
     ALIGNMENT_LANGUAGES,
@@ -20,6 +28,8 @@ from runtime.constants import (
     PROTOCOL_VERSION,
     RECOVERY_CONTEXT_SECONDS,
     RECOVERY_CORE_MAX_SECONDS,
+    RECOVERY_MAX_SPEECH_CONTEXT_SECONDS,
+    RECOVERY_MIN_UNCLAIMED_EDGE_SECONDS,
     SCRIPT_MATCH_MODE,
     UNSUPPORTED_ALIGNMENT_ERROR,
     VAD_MIN_SPEECH_MS,
@@ -40,13 +50,17 @@ from runtime.core.types import (
     TimedToken,
     TimelineSpec,
 )
-from runtime.inference.aligner import AlignmentResult, QwenForcedAlignerEngine
+from runtime.inference.aligner import (
+    AlignmentResult,
+    QwenForcedAlignerEngine,
+    normalize_alignment_text,
+)
 from runtime.inference.asr import QwenASREngine
 from runtime.inference.model_manager import ModelManager
 from runtime.inference.reconcile import (
     TokenCandidate,
     build_token_candidates,
-    find_unclaimed_speech_regions,
+    find_unclaimed_speech_edges,
     intersect_speech_regions,
     merge_regions,
     reconcile_candidates,
@@ -61,6 +75,7 @@ from runtime.subtitles.quantize import quantize_blocks
 from runtime.subtitles.script_match import (
     DIRECT_MAX_AUDIO_SECONDS,
     DIRECT_MIN_LINE_COVERAGE,
+    FALLBACK_ALIGNMENT_MIN_WINDOW_SECONDS,
     FALLBACK_MIN_ALIGNMENT_COVERAGE,
     FALLBACK_MIN_GLOBAL_ANCHOR_COVERAGE,
     FALLBACK_MIN_MAPPING_COVERAGE,
@@ -72,12 +87,14 @@ from runtime.subtitles.script_match import (
     map_aligned_tokens_to_lines,
     parse_reference_lines,
     reference_alignment_text,
+    stabilize_anchor_windows,
 )
 from runtime.subtitles.segmenter import (
     effective_max_chars,
     join_token_text,
     postprocess_subtitle_blocks,
     segment_tokens,
+    segment_tokens_with_speech_probabilities,
 )
 from runtime.subtitles.srt import write_srt
 
@@ -93,15 +110,22 @@ PREVIOUS_TAIL_CHARACTERS = 160
 CPU_SELF_REPAIR_ERRORS = frozenset(
     {"ASR_TOKEN_LIMIT_REACHED", "ASR_REPETITION_DETECTED"}
 )
+RECOVERY_BOUNDARY_REASON = "coverage_recovery"
+RECOVERY_SUFFIX_BOUNDARY_REASON = "coverage_recovery_suffix"
+RECOVERY_RELOCATION_LOOKAHEAD_SECONDS = 5.0
+RECOVERY_SINGLE_TOKEN_LOOKAHEAD_SECONDS = 2.0
+RECOVERY_SINGLE_TOKEN_MAX_CORE_SECONDS = 1.5
+RECOVERY_MAX_MATCH_TOKENS = 24
+RECOVERY_ALIGNMENT_PREFIX_MAX_TOKENS = 2
 
 
 class SpeechDetector(Protocol):
-    def detect(
+    def analyze(
         self,
         store: AudioStore,
         *,
         is_cancelled: CancelCallback | None = None,
-    ) -> list[SpeechRegion]: ...
+    ) -> VADAnalysis: ...
 
 
 class ASREngine(Protocol):
@@ -197,12 +221,15 @@ class WindowRecord:
     self_repair_backend: str = ""
     self_repair_from_error: str = ""
     core_claimed: bool = False
+    alignment_prefix_characters: int = 0
 
     def diagnostic(self, sample_rate: int) -> dict[str, object]:
         value = self.window.to_dict(sample_rate)
         value["recovery"] = self.recovery
         value["asr"] = self.asr.diagnostic()
         value["core_claimed"] = self.core_claimed
+        if self.alignment_prefix_characters:
+            value["alignment_prefix_characters"] = self.alignment_prefix_characters
         if self.alignment is not None:
             value["alignment_valid"] = self.alignment.valid
             value["alignment_text_coverage"] = round(self.alignment.text_coverage, 4)
@@ -224,6 +251,42 @@ class PipelineStats:
     recovery_success_count: int = 0
     cpu_self_repair_attempt_count: int = 0
     cpu_self_repair_success_count: int = 0
+
+
+@dataclass(slots=True)
+class RecoveryTranscriptStabilization:
+    initial_indices_by_window: dict[int, list[int]] = field(default_factory=dict)
+    stabilized_window_count: int = 0
+    rejected_window_count: int = 0
+    alignment_context_anchor_window_count: int = 0
+    transcript_anchor_window_count: int = 0
+
+    def apply(
+        self,
+        records: list[WindowRecord],
+        initial_candidates: list[TokenCandidate],
+        recovered_candidates: list[TokenCandidate],
+    ) -> tuple[list[TokenCandidate], list[TokenCandidate], int]:
+        accepted_windows = {
+            record.window.index for record in records if record.core_claimed
+        }
+        removed_indices = {
+            index
+            for window_index, indices in self.initial_indices_by_window.items()
+            if window_index in accepted_windows
+            for index in indices
+        }
+        retained_initial = [
+            candidate
+            for index, candidate in enumerate(initial_candidates)
+            if index not in removed_indices
+        ]
+        retained_recovered = [
+            candidate
+            for candidate in recovered_candidates
+            if candidate.window_index in accepted_windows
+        ]
+        return retained_initial, retained_recovered, len(removed_indices)
 
 
 def _accumulate_metric_ms(
@@ -328,6 +391,216 @@ def _record_asr_result(stats: PipelineStats, result: ASRResult) -> None:
         stats.asr_token_limit_count += 1
     elif result.error == "ASR_REPETITION_DETECTED":
         stats.asr_repetition_stop_count += 1
+
+
+def _has_visible_punctuation(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("P") for character in value)
+
+
+def _normalized_suffix(value: str, character_count: int) -> str | None:
+    characters = list(value)
+    if character_count > len(characters):
+        return None
+    return "".join(characters[-character_count:]) if character_count else ""
+
+
+def _recovery_prefix_match_score(recovery: str, candidate: str) -> float | None:
+    suffix = _normalized_suffix(recovery, len(candidate))
+    if suffix is None:
+        return None
+    if suffix == candidate:
+        return 1.0
+    ratio = SequenceMatcher(None, suffix, candidate, autojunk=False).ratio()
+    accepted = (
+        False
+        if len(candidate) <= 1
+        else ratio >= (2.0 / 3.0 if len(candidate) <= 3 else 0.45)
+    )
+    return ratio if accepted else None
+
+
+def stabilize_recovery_transcripts(
+    records: list[WindowRecord],
+    initial_candidates: list[TokenCandidate],
+    *,
+    language: str,
+    sample_rate: int,
+    initial_records: list[WindowRecord] | None = None,
+) -> RecoveryTranscriptStabilization:
+    """Use local ASR only to select timing repairs from the initial transcript."""
+    plan = RecoveryTranscriptStabilization()
+    if sample_rate <= 0:
+        plan.rejected_window_count = sum(record.recovery for record in records)
+        return plan
+
+    consumed: set[int] = set()
+    ordered_initial = sorted(
+        range(len(initial_candidates)),
+        key=lambda index: (
+            initial_candidates[index].token.start,
+            initial_candidates[index].token.end,
+            index,
+        ),
+    )
+    for record in sorted(records, key=lambda item: item.window.core_start_sample):
+        record.alignment_prefix_characters = 0
+        if not record.recovery or not record.asr.valid or not record.asr.text:
+            continue
+        core_start = record.window.core_start_sample / float(sample_rate)
+        core_end = record.window.core_end_sample / float(sample_rate)
+        recovery_text = normalize_alignment_text(record.asr.text)
+        if not recovery_text:
+            record.asr.valid = False
+            record.asr.error = "RECOVERY_TEXT_UNSUPPORTED_BY_INITIAL_TRANSCRIPT"
+            plan.rejected_window_count += 1
+            continue
+        eligible = [
+            index
+            for index in ordered_initial
+            if index not in consumed
+            and initial_candidates[index].token.end > core_start + 1.0e-6
+            and initial_candidates[index].token.start
+            <= core_end + RECOVERY_RELOCATION_LOOKAHEAD_SECONDS
+            and normalize_alignment_text(initial_candidates[index].token.text)
+        ][:RECOVERY_MAX_MATCH_TOKENS]
+
+        best: tuple[list[int], int, float] | None = None
+        candidate_text = ""
+        for position, index in enumerate(eligible):
+            candidate_text += normalize_alignment_text(
+                initial_candidates[index].token.text
+            )
+            score = _recovery_prefix_match_score(recovery_text, candidate_text)
+            if score is None:
+                continue
+            indices = eligible[: position + 1]
+            last_has_punctuation = _has_visible_punctuation(
+                initial_candidates[index].token.text
+            )
+            if len(candidate_text) == 1 and (
+                not last_has_punctuation
+                or core_end - core_start > RECOVERY_SINGLE_TOKEN_MAX_CORE_SECONDS
+                or initial_candidates[index].token.start
+                > core_end + RECOVERY_SINGLE_TOKEN_LOOKAHEAD_SECONDS
+            ):
+                continue
+            candidate = (indices, len(candidate_text), score)
+            if best is None or (candidate[1], candidate[2]) > (best[1], best[2]):
+                best = candidate
+
+        if (
+            best is None
+            and len(recovery_text) == 1
+            and core_end - core_start <= RECOVERY_SINGLE_TOKEN_MAX_CORE_SECONDS
+            and eligible
+        ):
+            index = eligible[0]
+            token = initial_candidates[index].token
+            if (
+                len(normalize_alignment_text(token.text)) == 1
+                and _has_visible_punctuation(record.asr.text)
+                and _has_visible_punctuation(token.text)
+                and token.start <= core_end + RECOVERY_SINGLE_TOKEN_LOOKAHEAD_SECONDS
+            ):
+                best = ([index], 1, 0.0)
+
+        if best is None:
+            transcript_anchor = next(
+                (
+                    source
+                    for source in initial_records or []
+                    if not source.recovery
+                    and not source.core_claimed
+                    and source.asr.valid
+                    and source.asr.text
+                    and source.window.core_start_sample
+                    < record.window.core_end_sample
+                    and source.window.core_end_sample
+                    > record.window.core_start_sample
+                    and normalize_alignment_text(source.asr.text) == recovery_text
+                ),
+                None,
+            )
+            if transcript_anchor is not None:
+                record.asr.text = transcript_anchor.asr.text
+                plan.stabilized_window_count += 1
+                plan.transcript_anchor_window_count += 1
+                continue
+            record.asr.valid = False
+            record.asr.error = "RECOVERY_TEXT_UNSUPPORTED_BY_INITIAL_TRANSCRIPT"
+            plan.rejected_window_count += 1
+            continue
+
+        indices = best[0]
+        alignment_tokens: list[TimedToken] = []
+        if record.window.boundary_reason == RECOVERY_SUFFIX_BOUNDARY_REASON:
+            input_start = record.window.input_start_sample / float(sample_rate)
+            prefix_indices = [
+                index
+                for index in ordered_initial
+                if index not in indices
+                and initial_candidates[index].token.start >= input_start - 1.0e-6
+                and initial_candidates[index].token.start < core_start
+                and initial_candidates[index].token.end <= core_start + 1.0e-6
+                and initial_candidates[index].token.end > input_start + 1.0e-6
+                and normalize_alignment_text(initial_candidates[index].token.text)
+            ][-RECOVERY_ALIGNMENT_PREFIX_MAX_TOKENS:]
+            if prefix_indices and _has_visible_punctuation(
+                initial_candidates[prefix_indices[-1]].token.text
+            ):
+                prefix_tokens = [
+                    initial_candidates[index].token for index in prefix_indices
+                ]
+                prefix_text = join_token_text(prefix_tokens, language)
+                record.alignment_prefix_characters = len(
+                    normalize_alignment_text(prefix_text)
+                )
+                alignment_tokens.extend(prefix_tokens)
+                plan.alignment_context_anchor_window_count += 1
+
+        alignment_tokens.extend(initial_candidates[index].token for index in indices)
+        record.asr.text = join_token_text(alignment_tokens, language)
+        consumed.update(indices)
+        plan.initial_indices_by_window[record.window.index] = indices
+        plan.stabilized_window_count += 1
+    return plan
+
+
+def _forced_alignment_window(record: WindowRecord) -> InferenceWindow:
+    window = record.window
+    if (
+        record.recovery
+        and window.boundary_reason == RECOVERY_SUFFIX_BOUNDARY_REASON
+        and record.alignment_prefix_characters == 0
+    ):
+        return replace(
+            window,
+            input_start_sample=window.core_start_sample,
+            input_end_sample=window.core_end_sample,
+            speech_samples=min(window.speech_samples, window.sample_count),
+        )
+    return window
+
+
+def _remove_alignment_prefix(
+    tokens: list[TimedToken],
+    prefix_characters: int,
+) -> list[TimedToken] | None:
+    if prefix_characters == 0:
+        return list(tokens)
+    remaining = prefix_characters
+    first_owned = len(tokens)
+    for index, token in enumerate(tokens):
+        count = len(normalize_alignment_text(token.text))
+        if count == 0:
+            continue
+        if count > remaining:
+            return None
+        remaining -= count
+        if remaining == 0:
+            first_owned = index + 1
+            break
+    return list(tokens[first_owned:]) if remaining == 0 else None
 
 
 def transcribe_window(
@@ -488,16 +761,39 @@ def _recovery_window(
     speech_regions: list[SpeechRegion],
     total_samples: int,
     sample_rate: int,
+    boundary_reason: str = RECOVERY_BOUNDARY_REASON,
 ) -> InferenceWindow:
     context = int(round(RECOVERY_CONTEXT_SECONDS * sample_rate))
+    speech_context = int(round(RECOVERY_MAX_SPEECH_CONTEXT_SECONDS * sample_rate))
+    input_start = max(0, region.start_sample - context)
+    input_end = min(total_samples, region.end_sample + context)
+
+    # 保留长静音上下文，但不让邻近已识别语音淹没恢复 core。
+    for speech in sorted(
+        speech_regions,
+        key=lambda item: (item.start_sample, item.end_sample),
+    ):
+        if speech.end_sample <= region.start_sample:
+            if speech.end_sample > input_start:
+                input_start = max(input_start, speech.end_sample)
+        elif speech.start_sample < region.start_sample < speech.end_sample:
+            input_start = max(input_start, region.start_sample - speech_context)
+
+        if speech.start_sample >= region.end_sample:
+            if speech.start_sample < input_end:
+                input_end = min(input_end, speech.start_sample)
+            break
+        if speech.start_sample < region.end_sample < speech.end_sample:
+            input_end = min(input_end, region.end_sample + speech_context)
+
     return InferenceWindow(
         index=index,
         core_start_sample=region.start_sample,
         core_end_sample=region.end_sample,
-        input_start_sample=max(0, region.start_sample - context),
-        input_end_sample=min(total_samples, region.end_sample + context),
+        input_start_sample=input_start,
+        input_end_sample=input_end,
         speech_samples=speech_samples_in_region(speech_regions, region),
-        boundary_reason="coverage_recovery",
+        boundary_reason=boundary_reason,
     )
 
 
@@ -526,7 +822,7 @@ class TranscriptionPipeline:
         )
         self._asr_factory = asr_factory
         self._aligner_factory = aligner_factory
-        self.speech_detector = speech_detector or SileroVAD()
+        self.speech_detector = speech_detector or OmniVAD()
         self._owns_inference = inference_service is None
         self.log = logging.getLogger("davinci_asr.pipeline")
 
@@ -538,14 +834,27 @@ class TranscriptionPipeline:
         max_chars: int,
         remove_gaps: bool,
         trim_end_punctuation: bool,
+        probabilities: SpeechProbabilityTrack | None = None,
+        sample_rate: int | None = None,
     ) -> list[SubtitleBlock]:
-        blocks = segment_tokens(
-            tokens,
-            language=language,
-            max_chars=max_chars,
-            remove_gaps=remove_gaps,
-            trim_end_punctuation=trim_end_punctuation,
-        )
+        if probabilities is None or sample_rate is None:
+            blocks = segment_tokens(
+                tokens,
+                language=language,
+                max_chars=max_chars,
+                remove_gaps=remove_gaps,
+                trim_end_punctuation=trim_end_punctuation,
+            )
+        else:
+            blocks = segment_tokens_with_speech_probabilities(
+                tokens,
+                language=language,
+                max_chars=max_chars,
+                probabilities=probabilities,
+                sample_rate=sample_rate,
+                remove_gaps=remove_gaps,
+                trim_end_punctuation=trim_end_punctuation,
+            )
         self.log.info(
             "provider_max_chars=%d effective_max_chars=%d subtitle_blocks=%d",
             max_chars,
@@ -588,10 +897,12 @@ class TranscriptionPipeline:
     ) -> str:
         update("preparing", 7, "Detecting speech for language identification")
         vad_started = time.monotonic()
-        speech_regions = self.speech_detector.detect(store, is_cancelled=cancelled)
+        analysis = self.speech_detector.analyze(store, is_cancelled=cancelled)
+        speech_regions = list(analysis.speech_regions)
         metrics.milliseconds("vad_ms", time.monotonic() - vad_started)
         windows = plan_windows(
             speech_regions=speech_regions,
+            probabilities=analysis.probabilities,
             total_samples=store.sample_count,
             sample_rate=store.sample_rate,
         )
@@ -734,6 +1045,12 @@ class TranscriptionPipeline:
                     f"unmapped={plan.unmapped_line_indices}"
                 )
 
+            stable_plan = stabilize_anchor_windows(
+                plan.windows,
+                duration=store.duration_seconds,
+                minimum_window_seconds=FALLBACK_ALIGNMENT_MIN_WINDOW_SECONDS,
+            )
+
             update(
                 "loading_aligner",
                 77,
@@ -745,13 +1062,13 @@ class TranscriptionPipeline:
             tokens: list[TimedToken] = []
             coverages: list[float] = []
             try:
-                for index, window in enumerate(plan.windows):
+                for index, window in enumerate(stable_plan.windows):
                     if cancelled():
                         raise InterruptedError("Job cancelled")
                     update(
                         "aligning",
-                        79 + int(11 * (index + 1) / len(plan.windows)),
-                        f"Aligning script line {index + 1}/{len(plan.windows)}",
+                        79 + int(11 * (index + 1) / len(stable_plan.windows)),
+                        f"Aligning script line {index + 1}/{len(stable_plan.windows)}",
                     )
                     start_sample = max(0, int(round(window.start * store.sample_rate)))
                     end_sample = min(
@@ -837,6 +1154,15 @@ class TranscriptionPipeline:
                     "fallback_anchor_line_coverages": [
                         round(value, 6) for value in plan.line_coverages
                     ],
+                    "fallback_anchor_collapsed_line_indices": (
+                        stable_plan.collapsed_line_indices
+                    ),
+                    "fallback_anchor_window_repair_count": len(
+                        stable_plan.collapsed_line_indices
+                    ),
+                    "fallback_anchor_alignment_min_window_seconds": round(
+                        stable_plan.minimum_window_seconds, 6
+                    ),
                 },
             )
         finally:
@@ -899,9 +1225,7 @@ class TranscriptionPipeline:
             script_remove_gaps_ignored=False,
             script_trim_end_punctuation_ignored=False,
             script_remove_gaps_applied=request.subtitle.remove_gaps,
-            script_trim_end_punctuation_applied=(
-                request.subtitle.trim_end_punctuation
-            ),
+            script_trim_end_punctuation_applied=(request.subtitle.trim_end_punctuation),
             asr_model_load_ms=0.0,
             aligner_model_load_ms=0.0,
         )
@@ -972,9 +1296,7 @@ class TranscriptionPipeline:
                 direct_reasons.extend(quality.reasons)
                 direct_unique_ratio = quality.unique_interval_ratio
                 direct_span_ratio = quality.aligned_span_ratio
-                direct_locally_collapsed_lines = (
-                    quality.locally_collapsed_line_indices
-                )
+                direct_locally_collapsed_lines = quality.locally_collapsed_line_indices
             except InterruptedError:
                 raise
             except Exception as exc:
@@ -1150,23 +1472,41 @@ class TranscriptionPipeline:
 
             update("preparing", 7, "Detecting speech")
             vad_started = time.monotonic()
-            speech_regions = self.speech_detector.detect(
-                audio_store, is_cancelled=cancelled
+            analysis = self.speech_detector.analyze(audio_store, is_cancelled=cancelled)
+            speech_regions = list(analysis.speech_regions)
+            atomic_speech_regions = atomic_speech_regions_from_probabilities(
+                analysis.probabilities,
+                audio_store.sample_rate,
             )
             metrics.milliseconds("vad_ms", time.monotonic() - vad_started)
             windows = plan_windows(
                 speech_regions=speech_regions,
+                probabilities=analysis.probabilities,
                 total_samples=audio_store.sample_count,
                 sample_rate=audio_store.sample_rate,
             )
             metrics.values.update(
                 vad_speech_region_count=len(speech_regions),
+                coverage_atomic_speech_region_count=len(atomic_speech_regions),
                 vad_speech_seconds=round(
                     sum(region.sample_count for region in speech_regions)
                     / float(audio_store.sample_rate),
                     3,
                 ),
+                vad_probability_frame_count=analysis.probabilities.frame_count,
+                vad_probability_frame_hop_ms=round(
+                    analysis.probabilities.frame_hop_samples
+                    / float(audio_store.sample_rate)
+                    * 1000.0,
+                    3,
+                ),
                 window_count=len(windows),
+                probability_valley_cut_count=sum(
+                    window.boundary_reason == "probability_valley" for window in windows
+                ),
+                hard_max_cut_count=sum(
+                    window.boundary_reason == "hard_max" for window in windows
+                ),
                 asr_window_max_new_tokens=ASR_WINDOW_MAX_NEW_TOKENS,
                 window_core_seconds=[
                     round(window.sample_count / float(audio_store.sample_rate), 3)
@@ -1180,6 +1520,37 @@ class TranscriptionPipeline:
                     for window in windows
                 ],
                 window_boundary_reason=[window.boundary_reason for window in windows],
+                window_boundary_probability=[
+                    (
+                        None
+                        if window.boundary_probability is None
+                        else round(window.boundary_probability, 6)
+                    )
+                    for window in windows
+                ],
+                window_valley_width_seconds=[
+                    round(
+                        window.valley_width_samples / float(audio_store.sample_rate),
+                        3,
+                    )
+                    for window in windows
+                ],
+                window_valley_mean_probability=[
+                    (
+                        None
+                        if window.valley_mean_probability is None
+                        else round(window.valley_mean_probability, 6)
+                    )
+                    for window in windows
+                ],
+                window_valley_p95_probability=[
+                    (
+                        None
+                        if window.valley_p95_probability is None
+                        else round(window.valley_p95_probability, 6)
+                    )
+                    for window in windows
+                ],
                 window_target_seconds=WINDOW_TARGET_SECONDS,
                 window_soft_max_seconds=WINDOW_SOFT_MAX_SECONDS,
                 window_hard_max_seconds=WINDOW_HARD_MAX_SECONDS,
@@ -1291,14 +1662,15 @@ class TranscriptionPipeline:
                 int(round(RECOVERY_CORE_MAX_SECONDS * audio_store.sample_rate)),
             )
             auditable_speech_regions = split_speech_regions(
-                speech_regions,
+                atomic_speech_regions,
                 boundaries=[window.core_end_sample for window in windows[:-1]],
                 max_samples=recovery_core_max_samples,
             )
-            initial_holes = find_unclaimed_speech_regions(
+            initial_holes = find_unclaimed_speech_edges(
                 auditable_speech_regions,
                 initial_candidates,
                 audio_store.sample_rate,
+                RECOVERY_MIN_UNCLAIMED_EDGE_SECONDS,
             )
             initial_holes = merge_regions(
                 initial_holes,
@@ -1312,7 +1684,7 @@ class TranscriptionPipeline:
             metrics.values["initial_coverage_hole_count"] = len(initial_holes)
             metrics.values["initial_coverage_hole_seconds"] = round(
                 sum(
-                    speech_samples_in_region(speech_regions, region)
+                    speech_samples_in_region(atomic_speech_regions, region)
                     for region in initial_holes
                 )
                 / float(audio_store.sample_rate),
@@ -1320,10 +1692,17 @@ class TranscriptionPipeline:
             )
             metrics.values["recovery_region_count"] = len(recovery_regions)
             metrics.values["recovery_context_seconds"] = RECOVERY_CONTEXT_SECONDS
+            metrics.values["recovery_max_speech_context_seconds"] = (
+                RECOVERY_MAX_SPEECH_CONTEXT_SECONDS
+            )
             metrics.values["recovery_core_max_seconds"] = RECOVERY_CORE_MAX_SECONDS
+            metrics.values["recovery_min_unclaimed_edge_seconds"] = (
+                RECOVERY_MIN_UNCLAIMED_EDGE_SECONDS
+            )
 
             recovered_candidates: list[TokenCandidate] = []
             recovery_records: list[WindowRecord] = []
+            recovery_stabilization = RecoveryTranscriptStabilization()
             if recovery_regions:
                 update("loading_asr", 78, "Loading Qwen3 ASR for coverage recovery")
                 asr, recovery_asr_load_ms = self.inference.acquire_asr(
@@ -1334,12 +1713,20 @@ class TranscriptionPipeline:
                 )
                 try:
                     for index, region in enumerate(recovery_regions):
+                        boundary_reason = RECOVERY_BOUNDARY_REASON
+                        if any(
+                            speech.start_sample < region.start_sample
+                            and speech.end_sample >= region.end_sample
+                            for speech in atomic_speech_regions
+                        ):
+                            boundary_reason = RECOVERY_SUFFIX_BOUNDARY_REASON
                         window = _recovery_window(
                             index=len(windows) + index,
                             region=region,
-                            speech_regions=speech_regions,
+                            speech_regions=atomic_speech_regions,
                             total_samples=audio_store.sample_count,
                             sample_rate=audio_store.sample_rate,
+                            boundary_reason=boundary_reason,
                         )
                         update(
                             "transcribing",
@@ -1433,6 +1820,14 @@ class TranscriptionPipeline:
                     finally:
                         cpu_asr.unload()
 
+                recovery_stabilization = stabilize_recovery_transcripts(
+                    recovery_records,
+                    initial_candidates,
+                    language=detected_language,
+                    sample_rate=audio_store.sample_rate,
+                    initial_records=records,
+                )
+
                 update(
                     "loading_aligner",
                     83,
@@ -1456,10 +1851,11 @@ class TranscriptionPipeline:
                         )
                         inference_started = time.monotonic()
                         try:
+                            alignment_window = _forced_alignment_window(record)
                             alignment = _align_window(
                                 aligner=aligner,
                                 store=audio_store,
-                                window=record.window,
+                                window=alignment_window,
                                 transcript=record.asr.text,
                                 language=detected_language,
                                 cancelled=cancelled,
@@ -1468,6 +1864,24 @@ class TranscriptionPipeline:
                             stats.aligner_inference_seconds += (
                                 time.monotonic() - inference_started
                             )
+                        if alignment.valid and record.alignment_prefix_characters:
+                            owned_tokens = _remove_alignment_prefix(
+                                alignment.tokens,
+                                record.alignment_prefix_characters,
+                            )
+                            if owned_tokens:
+                                alignment = AlignmentResult(
+                                    owned_tokens,
+                                    alignment.text_coverage,
+                                    True,
+                                )
+                            else:
+                                alignment = AlignmentResult(
+                                    [],
+                                    alignment.text_coverage,
+                                    False,
+                                    "RECOVERY_ALIGNMENT_PREFIX_MISMATCH",
+                                )
                         record.alignment = alignment
                         if not alignment.valid:
                             stats.alignment_invalid_count += 1
@@ -1492,6 +1906,15 @@ class TranscriptionPipeline:
                 finally:
                     self.inference.release_after_stage("forced_aligner")
 
+            (
+                initial_candidates,
+                recovered_candidates,
+                relocated_initial_token_count,
+            ) = recovery_stabilization.apply(
+                recovery_records,
+                initial_candidates,
+                recovered_candidates,
+            )
             tokens, duplicate_count = reconcile_candidates(
                 initial_candidates + recovered_candidates
             )
@@ -1501,7 +1924,7 @@ class TranscriptionPipeline:
                     for record in recovery_records
                     if not record.core_claimed
                     for speech in intersect_speech_regions(
-                        speech_regions,
+                        atomic_speech_regions,
                         record.window.core_region,
                     )
                 ],
@@ -1513,7 +1936,7 @@ class TranscriptionPipeline:
             ]
             remaining_hole_seconds = round(
                 sum(
-                    speech_samples_in_region(speech_regions, region)
+                    speech_samples_in_region(atomic_speech_regions, region)
                     for region in remaining_holes
                 )
                 / float(audio_store.sample_rate),
@@ -1532,6 +1955,19 @@ class TranscriptionPipeline:
                 alignment_invalid_count=stats.alignment_invalid_count,
                 alignment_text_coverage=alignment_coverages,
                 recovery_success_count=stats.recovery_success_count,
+                recovery_transcript_stabilized_count=(
+                    recovery_stabilization.stabilized_window_count
+                ),
+                recovery_transcript_rejected_count=(
+                    recovery_stabilization.rejected_window_count
+                ),
+                recovery_alignment_context_anchor_count=(
+                    recovery_stabilization.alignment_context_anchor_window_count
+                ),
+                recovery_transcript_anchor_count=(
+                    recovery_stabilization.transcript_anchor_window_count
+                ),
+                recovery_relocated_initial_token_count=(relocated_initial_token_count),
                 cpu_self_repair_attempt_count=(stats.cpu_self_repair_attempt_count),
                 cpu_self_repair_success_count=(stats.cpu_self_repair_success_count),
                 remaining_coverage_hole_count=len(remaining_holes),
@@ -1548,7 +1984,7 @@ class TranscriptionPipeline:
                 cache_dir / "chunks.json",
                 self._diagnostic_payload(
                     sample_rate=audio_store.sample_rate,
-                    speech_regions=speech_regions,
+                    speech_regions=atomic_speech_regions,
                     records=records,
                     recovery_regions=recovery_regions,
                     remaining_coverage_holes=remaining_holes,
@@ -1576,6 +2012,8 @@ class TranscriptionPipeline:
                 max_chars=request.subtitle.max_chars,
                 remove_gaps=request.subtitle.remove_gaps,
                 trim_end_punctuation=request.subtitle.trim_end_punctuation,
+                probabilities=analysis.probabilities,
+                sample_rate=audio_store.sample_rate,
             )
             if not blocks:
                 raise RuntimeError("No aligned subtitle blocks were produced")
