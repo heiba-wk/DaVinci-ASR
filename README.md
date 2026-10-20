@@ -4,6 +4,17 @@
 
 DaVinci ASR is a local AI subtitle tool for DaVinci Resolve. It reads the audio on the current timeline, creates timed subtitles, and imports them back into Resolve.
 
+## Download and install (macOS and Windows)
+
+Both macOS and Windows installers are available from the [official DaVinci ASR download page](https://www.heibagen.com/plugins/davinci-asr).
+
+1. Download the installer for your system and follow its installation instructions.
+2. Completely quit and reopen DaVinci Resolve.
+3. Open `DaVinci ASR` from `Workspace > Scripts > Utility`.
+4. Follow the steps below to download the models and create your first subtitles.
+
+The installer includes the Runtime. You do not need to install Python or set up a development environment for normal use.
+
 ## Models used
 
 - Speech recognition: `Qwen/Qwen3-ASR-0.6B-hf` or `Qwen/Qwen3-ASR-1.7B-hf`
@@ -12,64 +23,6 @@ DaVinci ASR is a local AI subtitle tool for DaVinci Resolve. It reads the audio 
 The plugin downloads the selected speech-recognition model and the shared
 Forced Aligner. Switching speech-recognition models does not download the
 Forced Aligner again when it is already installed.
-
-## macOS installation
-
-The macOS installer is available from the [official plugin download page](https://www.heibagen.com/plugins).
-
-1. Download and open the `.pkg` installer.
-2. Follow the installer, then reopen DaVinci Resolve.
-3. Open `DaVinci ASR` from `Workspace > Scripts > Utility`.
-
-## Windows source installation
-
-Windows currently requires a source installation. Prepare:
-
-- DaVinci Resolve
-- 64-bit Windows
-- Python 3.12
-- The project source and a working network connection
-
-### 1. Get the source
-
-```bash
-git clone https://github.com/heiba-wk/DaVinci-ASR.git
-cd DaVinci-ASR
-```
-
-You can also download and extract a ZIP archive from the GitHub **Code** menu.
-
-### 2. Install the Runtime dependencies
-
-Extract the source into a stable folder, for example `C:\HEIBA\DaVinci-ASR`. Open PowerShell in that folder and run:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements\direct.txt
-.\.venv\Scripts\python.exe -m pip install -e .
-```
-
-### 3. Install the Resolve plugin
-
-Copy the complete `DaVinci ASR` folder from the source into the `Utility` directory below. The final path should be:
-
-```text
-%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility\DaVinci ASR
-```
-
-Do not copy only `DaVinci ASR.lua`. The first model download and audio processing write to the `models` and `audio_temp` folders, so the current Windows user needs modify permission for the complete `DaVinci ASR` folder.
-
-### 4. Select the source Runtime
-
-Still in PowerShell at the source root, run:
-
-```powershell
-$runtime = (Resolve-Path ".\.venv\Scripts\DaVinciASRRuntime.exe").Path
-[Environment]::SetEnvironmentVariable("DAVINCI_ASR_RUNTIME", $runtime, "User")
-```
-
-Do not move the source folder after this step. Completely quit and reopen DaVinci Resolve, then open `DaVinci ASR` from `Workspace > Scripts > Utility`.
 
 ## How to use
 
@@ -82,15 +35,125 @@ Do not move the source folder after this step. Completely quit and reopen DaVinc
 
 The models only need to be downloaded once. Later uses reuse the local files.
 
+## Run from source (for developers)
+
+Use this section if you want to modify the plugin. Prepare DaVinci Resolve, **Python 3.12**, and a network connection. Use 64-bit Python on Windows.
+
+### 1. Get the source
+
+```bash
+git clone https://github.com/heiba-wk/DaVinci-ASR.git
+cd DaVinci-ASR
+```
+
+You can also download and extract a ZIP archive from the GitHub **Code** menu, then open a terminal in the extracted project folder.
+
+Keep the source and its virtual environment outside Resolve's `Utility` directory, for example `~/Projects/DaVinci-ASR` on macOS or `C:\HEIBA\DaVinci-ASR` on Windows. Only the `DaVinci ASR` plugin folder goes in `Utility`.
+
+### 2. Install the Runtime dependencies
+
+Run these commands from the source root. They create a separate Python environment and install the Runtime in editable mode, so your Python source changes take effect when the Runtime restarts.
+
+**macOS — Terminal:**
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements/direct.txt
+.venv/bin/python -m pip install -e .
+.venv/bin/DaVinciASRRuntime doctor --cpu
+```
+
+**Windows — PowerShell:**
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements\direct.txt
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\DaVinciASRRuntime.exe doctor --cpu
+```
+
+`doctor --cpu` reports the environment and model status. Models can show as not installed at this stage; download them from the plugin later. This command does not run a full transcription test.
+
+### 3. Install the Resolve plugin
+
+Copy the complete `DaVinci ASR` folder from the source to the corresponding location:
+
+| System | Final plugin folder |
+| --- | --- |
+| macOS | `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/DaVinci ASR` |
+| Windows | `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility\DaVinci ASR` |
+
+Do not copy only `DaVinci ASR.lua`. The plugin writes models, temporary audio, and settings beside the Lua entry, so your user account needs write permission for the complete `DaVinci ASR` folder.
+
+### 4. Select the source Runtime
+
+Run the command for your system from the source root. `DAVINCI_ASR_RUNTIME` tells Resolve to use your development Runtime.
+
+**macOS — Terminal:**
+
+```bash
+launchctl setenv DAVINCI_ASR_RUNTIME "$(pwd)/.venv/bin/DaVinciASRRuntime"
+```
+
+This setting applies to the current login session. Run it again after logging out or restarting macOS.
+
+**Windows — PowerShell:**
+
+```powershell
+$runtime = (Resolve-Path ".\.venv\Scripts\DaVinciASRRuntime.exe").Path
+[Environment]::SetEnvironmentVariable("DAVINCI_ASR_RUNTIME", $runtime, "User")
+```
+
+Keep the source folder at this location. Completely quit and reopen DaVinci Resolve, then open `DaVinci ASR` from `Workspace > Scripts > Utility`. Download the models in the plugin before creating subtitles.
+
+### 5. Modify and check your changes
+
+| Source | What to change |
+| --- | --- |
+| `DaVinci ASR/DaVinci ASR.lua` | Resolve UI, timeline audio export, and subtitle import |
+| `runtime/` | Model downloads, speech recognition, alignment, and subtitle generation |
+
+After changing Lua, copy the changed files into the installed plugin folder and reopen the plugin. After changing Python, close and reopen the plugin to restart its Runtime.
+
+Check the Runtime command entry point from the source root:
+
+```bash
+# macOS
+.venv/bin/DaVinciASRRuntime --help
+```
+
+```powershell
+# Windows
+.\.venv\Scripts\DaVinciASRRuntime.exe --help
+```
+
+Run `doctor --cpu` again after changing the environment. Then create subtitles from a short timeline in Resolve to check audio export, transcription, and subtitle import. Packaging instructions are in [macOS packaging](packaging/macos/README.md) and [Windows packaging](packaging/windows/README.md).
+
+To return to the installed Runtime, clear the development override and restart Resolve:
+
+```bash
+# macOS
+launchctl unsetenv DAVINCI_ASR_RUNTIME
+```
+
+```powershell
+# Windows
+[Environment]::SetEnvironmentVariable("DAVINCI_ASR_RUNTIME", $null, "User")
+```
+
 ## Troubleshooting
 
 ### DaVinci ASR is not listed in the menu
 
-Check the plugin folder hierarchy, fully restart Resolve, and confirm that `DAVINCI_ASR_RUNTIME` points to an existing `DaVinciASRRuntime.exe`.
+Check the plugin folder hierarchy and fully restart Resolve. Installer users can run the installer again if the plugin files are missing.
 
 ### The Runtime is missing or fails to start
 
-Return to the source folder, run the dependency installation commands again, confirm that `.venv\Scripts\DaVinciASRRuntime.exe` exists, reset the environment variable, and restart Resolve.
+Installer users: run the installer again. If you previously used a source Runtime, clear `DAVINCI_ASR_RUNTIME` using the commands above and restart Resolve.
+
+Developers: repeat the dependency installation steps, check that the Runtime executable exists in `.venv/bin` on macOS or `.venv\Scripts` on Windows, and set the override again.
 
 ### Model download fails
 
